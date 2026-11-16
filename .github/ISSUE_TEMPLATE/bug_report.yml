@@ -1,0 +1,33 @@
+name: Bug report
+description: Report a reproducible problem in Study Pen.
+body:
+  - type: markdown
+    attributes:
+      value: Do not include private paths, account names, settings files, credentials or screenshots containing private content.
+  - type: input
+    id: version
+    attributes:
+      label: Study Pen version
+      placeholder: 0.3.1
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version and display scale
+      placeholder: Windows 11, 150%, two displays
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include the action or shortcut and what happened.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true

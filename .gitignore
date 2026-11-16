@@ -1,0 +1,15 @@
+/target/
+/dist/
+*.pdb
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+settings.json*
+study-pen.settings.json*
+*.json.tmp
+.idea/
+.vscode/
+
