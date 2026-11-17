@@ -23,6 +23,7 @@ pub const COLOR_INNER_RADIUS: f32 = 60.0;
 pub const ACTION_RADIUS: f32 = 142.0;
 pub const COLOR_RADIUS: f32 = 148.0;
 pub const COLOR_COUNT: usize = 14;
+const OUTER_TOLERANCE: f32 = 14.0;
 const CENTER: f32 = SIZE_DIP as f32 * 0.5;
 const BG: Color = Color::rgb(23, 28, 32);
 const BORDER: Color = Color::rgb(59, 69, 76);
@@ -43,11 +44,39 @@ pub enum WheelStage {
 pub struct WheelState {
     pub stage: WheelStage,
     pub hover: Option<usize>,
-    pub committed: Option<usize>,
+    pub back_available: bool,
     pub primary: Color,
     pub secondary: Color,
     pub interactive: bool,
     pub tool: Tool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Selection {
+    TogglePen,
+    Clear,
+    ObjectEraser,
+    Color(Color),
+}
+
+impl WheelState {
+    /// Resolves a release from its final location independently of the last
+    /// rendered hover. Navigation sectors and neutral areas apply no action.
+    pub fn selection_at(&self, dx: f32, dy: f32) -> Option<Selection> {
+        let index = hit_test(self.stage, dx, dy)?;
+        match self.stage {
+            WheelStage::Actions => match index {
+                0 => Some(Selection::TogglePen),
+                1 => Some(Selection::Clear),
+                2 => Some(Selection::ObjectEraser),
+                _ => None,
+            },
+            WheelStage::Colors => colors(self.primary, self.secondary)
+                .get(index)
+                .copied()
+                .map(Selection::Color),
+        }
+    }
 }
 
 /// Action indices are left=0, right=1, top=2, bottom=3. Color indices start
@@ -61,6 +90,7 @@ pub fn hit_test(stage: WheelStage, dx: f32, dy: f32) -> Option<usize> {
         WheelStage::Actions => (ACTION_INNER_RADIUS.max(DEAD_ZONE), ACTION_RADIUS),
         WheelStage::Colors => (COLOR_INNER_RADIUS.max(DEAD_ZONE), COLOR_RADIUS),
     };
+    let outer = outer + OUTER_TOLERANCE;
     if !(inner * inner..=outer * outer).contains(&distance) {
         return None;
     }
@@ -282,7 +312,7 @@ impl Renderer {
             match state.stage {
                 WheelStage::Actions => {
                     for (index, angle) in ACTION_ANGLES.into_iter().enumerate() {
-                        let selected = state.committed == Some(index) || state.hover == Some(index);
+                        let selected = state.hover == Some(index);
                         sector(
                             &mut pixels,
                             ACTION_INNER_RADIUS,
@@ -299,7 +329,7 @@ impl Renderer {
                 }
                 WheelStage::Colors => {
                     let step = TAU / COLOR_COUNT as f32;
-                    let current = state.committed.unwrap_or(12);
+                    let current = 12;
                     for (index, color) in colors(state.primary, state.secondary)
                         .into_iter()
                         .enumerate()
@@ -363,25 +393,39 @@ impl Renderer {
                 }
             }
         }
+        let navigation = state.stage == WheelStage::Actions && state.hover == Some(3);
+        let title = if state.back_available {
+            "Back"
+        } else {
+            match (state.stage, state.hover) {
+                (WheelStage::Actions, Some(0)) if state.interactive => "Mouse",
+                (WheelStage::Actions, Some(0)) => "Pen",
+                (WheelStage::Actions, Some(1)) => "Clear",
+                (WheelStage::Actions, Some(2)) => "Eraser",
+                (WheelStage::Actions, Some(3)) => "Colors",
+                (WheelStage::Colors, Some(_)) => "Color",
+                _ => "Cancel",
+            }
+        };
         self.label(
-            if state.committed.is_some() {
-                "Selected"
-            } else {
-                "Select"
-            },
+            title,
             CENTER - 44.0,
             CENTER - 20.0,
             88.0,
             24.0,
             2,
-            if state.committed.is_some() {
-                ACCENT
-            } else {
-                TEXT
-            },
+            if state.hover.is_some() { ACCENT } else { TEXT },
         );
         self.label(
-            "Release to close",
+            if state.back_available {
+                "Hold for tools"
+            } else if navigation {
+                "Keep holding"
+            } else if state.hover.is_some() {
+                "Release to apply"
+            } else {
+                "Release to cancel"
+            },
             CENTER - 45.0,
             CENTER + 3.0,
             90.0,
@@ -780,7 +824,7 @@ mod tests {
         WheelState {
             stage: WheelStage::Actions,
             hover: Some(2),
-            committed: None,
+            back_available: false,
             primary: Color::rgb(99, 102, 241),
             secondary: Color::rgb(244, 63, 94),
             interactive: false,
@@ -812,7 +856,11 @@ mod tests {
         );
         assert_eq!(hit_test(WheelStage::Actions, ACTION_RADIUS, 0.0), Some(1));
         assert_eq!(
-            hit_test(WheelStage::Actions, ACTION_RADIUS + 0.1, 0.0),
+            hit_test(
+                WheelStage::Actions,
+                ACTION_RADIUS + OUTER_TOLERANCE + 0.1,
+                0.0
+            ),
             None
         );
         assert_eq!(
@@ -834,7 +882,22 @@ mod tests {
             ),
             None
         );
-        assert_eq!(hit_test(WheelStage::Actions, COLOR_RADIUS + 0.1, 0.0), None);
+        assert_eq!(
+            hit_test(WheelStage::Actions, ACTION_RADIUS + OUTER_TOLERANCE, 0.0),
+            Some(1)
+        );
+        assert_eq!(
+            hit_test(WheelStage::Colors, 0.0, -COLOR_RADIUS - OUTER_TOLERANCE),
+            Some(0)
+        );
+        assert_eq!(
+            hit_test(
+                WheelStage::Colors,
+                0.0,
+                -COLOR_RADIUS - OUTER_TOLERANCE - 0.1
+            ),
+            None
+        );
         assert_eq!(hit_test(WheelStage::Actions, f32::NAN, 100.0), None);
         assert_eq!(hit_test(WheelStage::Actions, f32::INFINITY, 0.0), None);
     }
@@ -854,6 +917,48 @@ mod tests {
         assert_eq!(&choices[..12], &PALETTE);
         assert_eq!(choices[12], primary);
         assert_eq!(choices[13], secondary);
+    }
+
+    #[test]
+    fn release_uses_the_final_pointer_instead_of_the_last_hovered_action() {
+        let mut state = state();
+        state.hover = Some(1);
+        assert_eq!(state.selection_at(-100.0, 0.0), Some(Selection::TogglePen));
+        assert_eq!(
+            state.selection_at(0.0, -100.0),
+            Some(Selection::ObjectEraser)
+        );
+        assert_eq!(state.selection_at(0.0, 0.0), None);
+        assert_eq!(state.selection_at(80.0, -80.0), None);
+        assert_eq!(state.selection_at(0.0, 100.0), None);
+        assert_eq!(
+            state.selection_at(ACTION_RADIUS + OUTER_TOLERANCE, 0.0),
+            Some(Selection::Clear)
+        );
+        assert_eq!(state.selection_at(200.0, 0.0), None);
+    }
+
+    #[test]
+    fn release_on_the_color_page_is_provisional_until_the_final_swatch() {
+        let mut state = state();
+        state.stage = WheelStage::Colors;
+        state.hover = Some(1);
+        let choices = colors(state.primary, state.secondary);
+        for (index, color) in choices.into_iter().enumerate() {
+            let angle = -FRAC_PI_2 + index as f32 * TAU / COLOR_COUNT as f32;
+            assert_eq!(
+                state.selection_at(angle.cos() * 100.0, angle.sin() * 100.0),
+                Some(Selection::Color(color))
+            );
+        }
+        state.back_available = true;
+        assert_eq!(state.selection_at(0.0, 0.0), None);
+        let separator = -FRAC_PI_2 + TAU / COLOR_COUNT as f32 * 0.5;
+        assert_eq!(
+            state.selection_at(separator.cos() * 100.0, separator.sin() * 100.0),
+            None
+        );
+        assert_eq!(state.selection_at(0.0, -200.0), None);
     }
 
     #[test]
@@ -880,7 +985,6 @@ mod tests {
         );
         state.stage = WheelStage::Colors;
         state.hover = Some(3);
-        state.committed = Some(3);
         renderer.render(&state).unwrap();
         for pixel in bytes(&renderer).as_chunks::<4>().0 {
             assert!(
@@ -926,7 +1030,6 @@ mod tests {
             if !colors_shown && start.elapsed().as_secs_f32() >= 25.0 {
                 state.stage = WheelStage::Colors;
                 state.hover = Some(3);
-                state.committed = Some(3);
                 renderer.render(&state).unwrap();
                 colors_shown = true;
             }

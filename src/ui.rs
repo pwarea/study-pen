@@ -1,7 +1,8 @@
-//! Small native GDI views. All dimensions below are device-independent pixels.
+//! Native settings views and antialiased toolbar icons in logical pixels.
 
 use crate::ink::{Color, Tool};
 use std::mem::size_of;
+use tiny_skia::{FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, Stroke, Transform};
 use windows_sys::Win32::{
     Foundation::{POINT, RECT},
     Graphics::Gdi::*,
@@ -469,10 +470,17 @@ fn cref(color: Color) -> u32 {
     color.r as u32 | ((color.g as u32) << 8) | ((color.b as u32) << 16)
 }
 
-/// Draws only the controls over the toolbar material. Icons remain upright
-/// when docked, and their centers use the same bounds as pointer hit testing.
-pub unsafe fn paint_toolbar_controls(dc: HDC, scale: f32, state: &ToolbarControls) {
-    let p = unsafe { Painter::new(dc, scale, None) };
+/// Produces premultiplied BGRA pixels at the window's actual physical size.
+pub fn toolbar_pixels(
+    width: u32,
+    height: u32,
+    scale: f32,
+    state: &ToolbarControls,
+) -> Option<Vec<u32>> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let mut pixmap = Pixmap::new(width, height)?;
     let (ink, grip) = if state.dark {
         (Color::rgb(250, 251, 254), Color::rgb(193, 200, 215))
     } else {
@@ -484,183 +492,189 @@ pub unsafe fn paint_toolbar_controls(dc: HDC, scale: f32, state: &ToolbarControl
     };
     for dx in [-2.5, 2.5] {
         for dy in [-4.0, 0.0, 4.0] {
-            p.circle(grip_x + dx, grip_y + dy, 1.0, Some(grip), grip, 1.0);
+            let circle = PathBuilder::from_circle(grip_x + dx, grip_y + dy, 0.72)?;
+            pixmap.fill_path(
+                &circle,
+                &icon_paint(grip),
+                FillRule::Winding,
+                Transform::from_scale(scale, scale),
+                None,
+            );
         }
     }
     for index in 0..TOOL_BUTTON_COUNT {
         let (left, top, width, height) = state.layout.button_bounds(index).unwrap();
         let x = left as f32 + width as f32 / 2.0;
         let y = top as f32 + height as f32 / 2.0;
-        toolbar_icon(&p, index, x, y, ink, state.primary);
+        let transform = Transform::from_row(
+            19.0 * scale / 24.0,
+            0.0,
+            0.0,
+            19.0 * scale / 24.0,
+            (x - 9.5) * scale,
+            (y - 9.5) * scale,
+        );
+        let path = toolbar_icon(index)?;
+        let stroke = Stroke {
+            width: 1.65,
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
+            ..Stroke::default()
+        };
+        pixmap.stroke_path(&path, &icon_paint(ink), &stroke, transform, None);
+        if index == 6 {
+            let swatch = PathBuilder::from_circle(12.0, 12.0, 5.7)?;
+            pixmap.fill_path(
+                &swatch,
+                &icon_paint(state.primary),
+                FillRule::Winding,
+                transform,
+                None,
+            );
+        }
     }
+    Some(
+        pixmap
+            .pixels()
+            .iter()
+            .map(|pixel| {
+                u32::from(pixel.blue())
+                    | (u32::from(pixel.green()) << 8)
+                    | (u32::from(pixel.red()) << 16)
+                    | (u32::from(pixel.alpha()) << 24)
+            })
+            .collect(),
+    )
 }
 
-fn toolbar_icon(p: &Painter<'_>, index: usize, x: f32, y: f32, color: Color, primary: Color) {
+fn icon_paint(color: Color) -> Paint<'static> {
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(color.r, color.g, color.b, 255);
+    paint.anti_alias = true;
+    paint
+}
+
+/// The 24-unit paths match the reviewed toolbar preview.
+fn toolbar_icon(index: usize) -> Option<Path> {
+    let mut path = PathBuilder::new();
     match index {
         0 => {
-            p.line(
-                &[
-                    (x - 6.0, y - 8.0),
-                    (x + 6.0, y + 1.0),
-                    (x, y + 2.0),
-                    (x - 4.0, y + 8.0),
-                    (x - 6.0, y - 8.0),
-                ],
-                color,
-                1.6,
-            );
+            path.move_to(5.0, 3.0);
+            path.line_to(18.7, 12.7);
+            path.line_to(11.9, 14.1);
+            path.line_to(8.0, 19.9);
+            path.close();
         }
         1 => {
-            p.line(
-                &[
-                    (x - 7.0, y + 7.0),
-                    (x - 5.0, y + 1.0),
-                    (x + 5.0, y - 9.0),
-                    (x + 9.0, y - 5.0),
-                    (x - 1.0, y + 5.0),
-                    (x - 7.0, y + 7.0),
-                ],
-                color,
-                1.7,
-            );
-            p.line(&[(x + 2.0, y - 6.0), (x + 6.0, y - 2.0)], color, 1.5);
-            p.line(&[(x - 2.0, y + 9.0), (x + 7.0, y + 9.0)], color, 1.6);
+            path.move_to(4.5, 19.5);
+            path.line_to(5.6, 13.9);
+            path.line_to(16.0, 3.6);
+            path.cubic_to(16.61, 2.99, 17.59, 2.99, 18.2, 3.6);
+            path.line_to(20.4, 5.8);
+            path.cubic_to(21.01, 6.41, 21.01, 7.39, 20.4, 8.0);
+            path.line_to(10.0, 18.4);
+            path.close();
+            path.move_to(13.7, 5.9);
+            path.line_to(18.2, 10.4);
+            path.move_to(12.5, 21.0);
+            path.line_to(19.5, 21.0);
         }
         2 => {
-            p.line(
-                &[
-                    (x - 9.0, y + 3.0),
-                    (x + 1.0, y - 8.0),
-                    (x + 9.0, y - 1.0),
-                    (x, y + 9.0),
-                    (x - 3.0, y + 9.0),
-                    (x - 9.0, y + 3.0),
-                ],
-                color,
-                1.7,
-            );
-            p.line(&[(x - 4.0, y - 2.0), (x + 3.0, y + 5.0)], color, 1.5);
+            path.move_to(3.8, 14.0);
+            path.line_to(12.7, 4.8);
+            path.cubic_to(13.46, 4.01, 14.74, 3.96, 15.5, 4.7);
+            path.line_to(19.6, 8.5);
+            path.cubic_to(20.41, 9.25, 20.46, 10.54, 19.7, 11.3);
+            path.line_to(12.3, 19.2);
+            path.line_to(8.4, 19.2);
+            path.line_to(3.9, 16.2);
+            path.cubic_to(3.18, 15.73, 3.13, 14.65, 3.8, 14.0);
+            path.close();
+            path.move_to(8.8, 9.0);
+            path.line_to(15.7, 15.4);
+            path.move_to(12.3, 19.2);
+            path.line_to(21.0, 19.2);
         }
         3 => {
-            for dx in [-1.0, 1.0] {
-                for dy in [-1.0, 1.0] {
-                    p.line(
-                        &[
-                            (x + 5.0 * dx, y + 8.0 * dy),
-                            (x + 8.0 * dx, y + 8.0 * dy),
-                            (x + 8.0 * dx, y + 5.0 * dy),
-                        ],
-                        color,
-                        1.4,
-                    );
-                }
-            }
-            p.line(
-                &[
-                    (x - 5.0, y + 1.0),
-                    (x + 1.0, y - 5.0),
-                    (x + 5.0, y - 1.0),
-                    (x - 1.0, y + 5.0),
-                    (x - 5.0, y + 1.0),
-                ],
-                color,
-                1.5,
-            );
-            p.line(&[(x - 2.0, y - 2.0), (x + 2.0, y + 2.0)], color, 1.4);
+            path.move_to(7.0, 3.0);
+            path.line_to(4.0, 3.0);
+            path.line_to(4.0, 6.0);
+            path.move_to(17.0, 3.0);
+            path.line_to(20.0, 3.0);
+            path.line_to(20.0, 6.0);
+            path.move_to(20.0, 17.0);
+            path.line_to(20.0, 20.0);
+            path.line_to(17.0, 20.0);
+            path.move_to(4.0, 17.0);
+            path.line_to(4.0, 20.0);
+            path.line_to(7.0, 20.0);
+            path.move_to(7.2, 12.5);
+            path.line_to(13.0, 6.5);
+            path.line_to(17.3, 10.7);
+            path.line_to(11.9, 16.5);
+            path.line_to(10.0, 16.5);
+            path.close();
+            path.move_to(9.3, 10.3);
+            path.line_to(13.8, 14.6);
         }
         4 => {
-            p.line(
-                &[
-                    (x - 8.0, y - 5.0),
-                    (x + 2.0, y - 5.0),
-                    (x + 7.0, y - 2.0),
-                    (x + 8.0, y + 3.0),
-                    (x + 5.0, y + 8.0),
-                    (x - 1.0, y + 9.0),
-                ],
-                color,
-                1.8,
-            );
-            p.line(
-                &[(x - 3.0, y - 10.0), (x - 8.0, y - 5.0), (x - 3.0, y)],
-                color,
-                1.8,
-            );
+            path.move_to(9.0, 5.0);
+            path.line_to(4.0, 10.0);
+            path.line_to(9.0, 15.0);
+            path.move_to(4.0, 10.0);
+            path.line_to(14.7, 10.0);
+            path.cubic_to(17.35, 10.0, 19.5, 12.15, 19.5, 14.8);
+            path.cubic_to(19.5, 17.45, 17.35, 19.6, 14.7, 19.6);
+            path.line_to(13.0, 19.6);
         }
         5 => {
-            p.line(
-                &[
-                    (x - 6.0, y - 4.0),
-                    (x - 5.0, y + 10.0),
-                    (x + 5.0, y + 10.0),
-                    (x + 6.0, y - 4.0),
-                ],
-                color,
-                1.6,
-            );
-            p.line(&[(x - 9.0, y - 6.0), (x + 9.0, y - 6.0)], color, 1.6);
-            p.line(
-                &[
-                    (x - 3.0, y - 6.0),
-                    (x - 3.0, y - 10.0),
-                    (x + 3.0, y - 10.0),
-                    (x + 3.0, y - 6.0),
-                ],
-                color,
-                1.6,
-            );
-            for dx in [-2.0, 2.0] {
-                p.line(&[(x + dx, y - 1.0), (x + dx, y + 6.0)], color, 1.0);
-            }
+            path.move_to(5.0, 6.0);
+            path.line_to(19.0, 6.0);
+            path.move_to(9.0, 6.0);
+            path.line_to(9.0, 4.0);
+            path.line_to(15.0, 4.0);
+            path.line_to(15.0, 6.0);
+            path.move_to(17.6, 8.5);
+            path.line_to(16.7, 19.5);
+            path.line_to(7.3, 19.5);
+            path.line_to(6.4, 8.5);
+            path.move_to(10.0, 10.0);
+            path.line_to(10.0, 16.0);
+            path.move_to(14.0, 10.0);
+            path.line_to(14.0, 16.0);
         }
-        6 => {
-            p.circle(x, y, 7.0, None, color, 1.0);
-            p.circle(x, y, 5.0, Some(primary), primary, 1.0);
-        }
+        6 => path.push_circle(12.0, 12.0, 8.3),
         7 => {
-            for (dy, dx) in [(-5.0, -2.0), (0.0, 3.0), (5.0, -1.0)] {
-                p.line(&[(x - 7.0, y + dy), (x + 7.0, y + dy)], color, 1.5);
-                p.line(
-                    &[(x + dx, y + dy - 2.0), (x + dx, y + dy + 2.0)],
-                    color,
-                    1.5,
-                );
+            for (y, x) in [(6.0, 10.0), (12.0, 14.0), (18.0, 9.0)] {
+                path.move_to(5.0, y);
+                path.line_to(19.0, y);
+                path.move_to(x, y - 2.0);
+                path.line_to(x, y + 2.0);
             }
         }
         8 => {
-            p.line(
-                &[
-                    (x - 7.0, y - 6.0),
-                    (x + 7.0, y - 6.0),
-                    (x + 7.0, y + 6.0),
-                    (x - 7.0, y + 6.0),
-                    (x - 7.0, y - 6.0),
-                ],
-                color,
-                1.5,
-            );
-            p.line(&[(x - 4.0, y + 3.0), (x + 4.0, y + 3.0)], color, 1.5);
+            path.move_to(4.5, 5.0);
+            path.line_to(19.5, 5.0);
+            path.line_to(19.5, 18.0);
+            path.line_to(4.5, 18.0);
+            path.close();
+            path.move_to(8.0, 14.5);
+            path.line_to(16.0, 14.5);
         }
         9 => {
-            p.line(
-                &[
-                    (x, y - 6.0),
-                    (x - 6.0, y - 6.0),
-                    (x - 6.0, y + 6.0),
-                    (x, y + 6.0),
-                ],
-                color,
-                1.5,
-            );
-            p.line(&[(x + 1.0, y), (x + 7.0, y)], color, 1.5);
-            p.line(
-                &[(x + 4.0, y - 3.0), (x + 7.0, y), (x + 4.0, y + 3.0)],
-                color,
-                1.5,
-            );
+            path.move_to(12.0, 5.0);
+            path.line_to(5.5, 5.0);
+            path.line_to(5.5, 19.0);
+            path.line_to(12.0, 19.0);
+            path.move_to(13.5, 12.0);
+            path.line_to(19.5, 12.0);
+            path.move_to(16.5, 9.0);
+            path.line_to(19.5, 12.0);
+            path.line_to(16.5, 15.0);
         }
-        _ => {}
+        _ => return None,
     }
+    path.finish()
 }
 
 /// Paints the fixed 460 by 620 DIP companion panel.
@@ -1057,78 +1071,6 @@ fn general(p: &Painter<'_>, state: &UiState) {
 mod tests {
     use super::*;
 
-    struct Canvas {
-        dc: HDC,
-        bitmap: HBITMAP,
-        previous: HGDIOBJ,
-        bits: *mut u8,
-        byte_count: usize,
-    }
-
-    impl Canvas {
-        fn new(width: i32, height: i32) -> Self {
-            unsafe {
-                let dc = CreateCompatibleDC(std::ptr::null_mut());
-                assert!(!dc.is_null());
-                let info = BITMAPINFO {
-                    bmiHeader: BITMAPINFOHEADER {
-                        biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                        biWidth: width,
-                        biHeight: -height,
-                        biPlanes: 1,
-                        biBitCount: 32,
-                        biCompression: BI_RGB,
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                };
-                let mut bits = std::ptr::null_mut();
-                let bitmap = CreateDIBSection(
-                    dc,
-                    &info,
-                    DIB_RGB_COLORS,
-                    &mut bits,
-                    std::ptr::null_mut(),
-                    0,
-                );
-                if bitmap.is_null() || bits.is_null() {
-                    if !bitmap.is_null() {
-                        DeleteObject(bitmap);
-                    }
-                    DeleteDC(dc);
-                    panic!("Could not allocate the native toolbar test canvas");
-                }
-                let previous = SelectObject(dc, bitmap);
-                let byte_count = width as usize * height as usize * 4;
-                std::ptr::write_bytes(bits.cast::<u8>(), 0, byte_count);
-                Self {
-                    dc,
-                    bitmap,
-                    previous,
-                    bits: bits.cast(),
-                    byte_count,
-                }
-            }
-        }
-
-        fn snapshot(&self) -> Vec<u8> {
-            unsafe {
-                GdiFlush();
-                std::slice::from_raw_parts(self.bits, self.byte_count).to_vec()
-            }
-        }
-    }
-
-    impl Drop for Canvas {
-        fn drop(&mut self) {
-            unsafe {
-                SelectObject(self.dc, self.previous);
-                DeleteObject(self.bitmap);
-                DeleteDC(self.dc);
-            }
-        }
-    }
-
     fn toolbar_state(layout: ToolbarLayout, dark: bool) -> ToolbarControls {
         ToolbarControls {
             layout,
@@ -1141,36 +1083,69 @@ mod tests {
     }
 
     #[test]
-    fn native_toolbar_paints_each_icon_without_covering_the_material() {
-        for (layout, scale) in [
-            (ToolbarLayout::Horizontal, 1.0),
-            (ToolbarLayout::Horizontal, 1.25),
-            (ToolbarLayout::Vertical, 1.25),
-            (ToolbarLayout::Vertical, 0.4),
-        ] {
-            let (width, height) = layout.size();
-            let physical = |dip: i32| (dip as f32 * scale).round() as usize;
-            let stride = 4 * physical(width);
-            for dark in [false, true] {
-                let canvas = Canvas::new(physical(width) as i32, physical(height) as i32);
-                unsafe {
-                    paint_toolbar_controls(canvas.dc, scale, &toolbar_state(layout, dark));
-                }
-                let pixels = canvas.snapshot();
-                let painted = |x: usize, y: usize| {
-                    let offset = y * stride + 4 * x;
-                    pixels[offset..offset + 3].iter().any(|value| *value != 0)
-                };
-                assert!(!painted(physical(width) - 1, physical(height) - 1));
-                for index in 0..TOOL_BUTTON_COUNT {
-                    let (x, y, w, h) = layout.button_bounds(index).unwrap();
-                    assert!(
-                        (physical(y)..physical(y + h)).any(|row| {
-                            (physical(x)..physical(x + w)).any(|column| painted(column, row))
-                        }),
-                        "Missing {layout:?} icon {index} at scale {scale}, dark {dark}"
+    fn toolbar_raster_preserves_antialiased_icons_at_common_dpi_and_fitted_scales() {
+        let scales = [96, 120, 144, 192].map(|dpi| dpi as f32 / 96.0);
+        for layout in [ToolbarLayout::Horizontal, ToolbarLayout::Vertical] {
+            for scale in scales.into_iter().chain([0.4]) {
+                let (width, height) = layout.size();
+                let physical = |dip: i32| (dip as f32 * scale).round() as usize;
+                let width = physical(width);
+                let height = physical(height);
+                for dark in [false, true] {
+                    let pixels = toolbar_pixels(
+                        width as u32,
+                        height as u32,
+                        scale,
+                        &toolbar_state(layout, dark),
                     )
+                    .expect("rasterize the actual toolbar controls");
+                    assert_eq!(pixels.len(), width * height);
+                    assert_eq!(pixels[0], 0);
+                    assert_eq!(pixels[width * height - 1], 0);
+                    for pixel in &pixels {
+                        let [blue, green, red, alpha] = pixel.to_le_bytes();
+                        assert!(blue <= alpha && green <= alpha && red <= alpha);
+                    }
+                    for index in 0..TOOL_BUTTON_COUNT {
+                        let (x, y, w, h) = layout.button_bounds(index).unwrap();
+                        let mut coverage = [false; 256];
+                        for row in physical(y)..physical(y + h) {
+                            for column in physical(x)..physical(x + w) {
+                                let alpha = (pixels[row * width + column] >> 24) as usize;
+                                if alpha != 0 {
+                                    coverage[alpha] = true;
+                                }
+                            }
+                        }
+                        assert!(
+                            coverage.iter().filter(|present| **present).count() >= 3,
+                            "Missing antialiased edge coverage for {layout:?} icon {index}, scale {scale}, dark {dark}"
+                        );
+                    }
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn near_black_primary_swatch_keeps_its_opaque_color_and_alpha() {
+        for layout in [ToolbarLayout::Horizontal, ToolbarLayout::Vertical] {
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                let (width, height) = layout.size();
+                let physical = |dip: i32| (dip as f32 * scale).round() as usize;
+                let mut state = toolbar_state(layout, false);
+                state.primary = Color::rgb(1, 2, 3);
+                let pixels = toolbar_pixels(
+                    physical(width) as u32,
+                    physical(height) as u32,
+                    scale,
+                    &state,
+                )
+                .unwrap();
+                let (x, y, width, height) = layout.button_bounds(6).unwrap();
+                let center =
+                    physical(y + height / 2) * physical(layout.size().0) + physical(x + width / 2);
+                assert_eq!(pixels[center], 0xff01_0203);
             }
         }
     }

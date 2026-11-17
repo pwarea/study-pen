@@ -1,4 +1,4 @@
-# Study Pen 0.1.1 — portable user guide
+# Study Pen 0.1.2 — portable user guide
 
 Study Pen is a small native Windows screen annotation app. This package supports Windows 10 and Windows 11 on x86-64 computers. macOS, Linux and native ARM64 builds are not included.
 
@@ -12,7 +12,7 @@ Use the pen button or **Ctrl + Alt + Shift + F1** to draw above other apps. Pres
 
 Drag the Study Pen handle toward a monitor's left or right side. On the right, its end can move about 32 logical pixels past the edge before the toolbar slides out and back in vertically. The distance scales with the display. If you release before reaching that threshold, the toolbar returns fully on screen in horizontal layout. Pull the top handle away from the edge to move the vertical toolbar continuously with the pointer. It stays vertical until the entire horizontal toolbar would fit inside the usable work area, then returns to horizontal. The top and bottom edges do not request vertical layout.
 
-Icons stay upright in both layouts. The toolbar scales uniformly to fit the monitor's usable work area, keeping every control accessible on smaller or heavily scaled displays. Its last orientation and position are saved and restored at the next launch.
+Antialiased icons stay upright in both layouts and scale with the display. The toolbar scales uniformly to fit the monitor's usable work area, keeping every control accessible on smaller or heavily scaled displays. Its last orientation and position are saved and restored at the next launch.
 
 ## Shortcuts
 
@@ -40,7 +40,7 @@ Open the color panel from the toolbar. Choose the primary or secondary color, se
 
 ## Radial menu
 
-First assign **Radial menu** in Settings → Shortcuts; it has no default key. The global shortcut works while the toolbar is hidden. Hold it to open a circular menu at the center of the monitor containing the pointer. The pointer moves to its neutral center. Move toward a sector and hover briefly to select:
+First assign **Radial menu** in Settings → Shortcuts; it has no default key. The global shortcut works while the toolbar is hidden. Hold it to open a circular menu at the center of the monitor containing the pointer. The pointer moves to its neutral center. Move toward a sector to highlight it, then release the shortcut's main key to apply the choice. Move between sectors while holding to reconsider.
 
 | Sector | Action |
 | --- | --- |
@@ -49,7 +49,9 @@ First assign **Radial menu** in Settings → Shortcuts; it has no default key. T
 | Top | Select the object eraser |
 | Bottom | Open the color wheel |
 
-Opening Colors recenters the pointer and shows 12 preset colors plus the primary and secondary color slots. The current color is highlighted. Hover briefly to set the primary color without clicking; the secondary color stays as saved. Each hold applies one tool action or color and keeps it highlighted until release; release and hold again for another selection. Releasing the shortcut's main key closes the menu, even if its modifier keys were released first. The pointer stays at its current position afterward.
+Hold over Colors briefly to open the color wheel and recenter the pointer. It offers 12 preset colors plus the primary and secondary color slots, with the current primary color highlighted. Move over a swatch and release to set the primary color. The secondary color stays as saved. After moving out toward a swatch, return to the center and hold briefly to go back to the tool menu. The center shows **Back** when this is available.
+
+Each hold applies at most one tool action or color on release. Release in the center, between sectors or beyond the wheel's outer tolerance to cancel, or press Esc while holding. The shortcut's main key closes the menu even if its modifier keys were released first. The pointer stays at its current position afterward.
 
 ## Hide, restore and exit
 
@@ -79,7 +81,7 @@ If a release only offers a download, close Study Pen before replacing the execut
 
 ## Verify the download
 
-The release includes `SHA256SUMS-0.1.1.txt` for its ZIP archives. Compare your ZIP's SHA-256 using this PowerShell command.
+The release includes `SHA256SUMS-0.1.2.txt` for its ZIP archives. Compare your ZIP's SHA-256 using this PowerShell command.
 
 ```powershell
 Get-FileHash .\study-pen-windows-x86_64-portable.zip -Algorithm SHA256

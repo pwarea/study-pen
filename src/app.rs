@@ -63,7 +63,8 @@ const DAILY_UPDATE_MS: u32 = 86_400_000;
 const GLASS_REFRESH_MS: u32 = 100;
 const REMOVE_REQUEST: u32 = WM_APP + 20;
 const UPDATE_REQUEST: u32 = WM_APP + 21;
-const RADIAL_DWELL: Duration = Duration::from_millis(90);
+const RADIAL_COLORS_DWELL: Duration = Duration::from_millis(110);
+const RADIAL_BACK_DWELL: Duration = Duration::from_millis(250);
 const UNAVAILABLE_SHORTCUTS: &str = "Shortcut unavailable. Select its amber row to change it.";
 const EDIT_HEX: usize = 200;
 const EDIT_BLUE: usize = 203;
@@ -78,14 +79,15 @@ struct EraserHold {
     resizing: bool,
 }
 
-/// One selection per hold. The color page resets its dwell after recentering.
+/// Hover remains provisional. Only releasing the main key applies a leaf.
 struct RadialHold {
     key: u32,
     center: POINT,
     scale: f32,
     state: WheelState,
     renderer: radial::Renderer,
-    dwell: HoverDwell,
+    navigation: RadialNavigation,
+    escape_down: bool,
 }
 
 struct ToolbarTips {
@@ -181,7 +183,7 @@ struct HoverDwell {
 }
 
 impl HoverDwell {
-    fn sample(&mut self, candidate: Option<usize>, now: Instant) -> Option<usize> {
+    fn sample(&mut self, candidate: Option<usize>, now: Instant, delay: Duration) -> Option<usize> {
         if self.candidate != candidate {
             self.candidate = candidate;
             self.since = candidate.map(|_| now);
@@ -190,13 +192,54 @@ impl HoverDwell {
         if candidate.is_some()
             && self
                 .since
-                .is_some_and(|since| now.duration_since(since) >= RADIAL_DWELL)
+                .is_some_and(|since| now.duration_since(since) >= delay)
         {
             self.since = None;
             candidate
         } else {
             None
         }
+    }
+}
+
+#[derive(Default)]
+struct RadialNavigation {
+    dwell: HoverDwell,
+    back_armed: bool,
+}
+
+impl RadialNavigation {
+    fn sample(
+        &mut self,
+        stage: WheelStage,
+        candidate: Option<usize>,
+        distance_squared: f32,
+        now: Instant,
+    ) -> Option<WheelStage> {
+        let (target, delay, destination) = match stage {
+            WheelStage::Actions => (
+                candidate.filter(|&index| index == 3),
+                RADIAL_COLORS_DWELL,
+                WheelStage::Colors,
+            ),
+            WheelStage::Colors => {
+                if distance_squared >= radial::COLOR_INNER_RADIUS.powi(2) {
+                    self.back_armed = true;
+                }
+                (
+                    self.back_available(stage, distance_squared).then_some(0),
+                    RADIAL_BACK_DWELL,
+                    WheelStage::Actions,
+                )
+            }
+        };
+        self.dwell.sample(target, now, delay).map(|_| destination)
+    }
+
+    fn back_available(&self, stage: WheelStage, distance_squared: f32) -> bool {
+        stage == WheelStage::Colors
+            && self.back_armed
+            && distance_squared <= radial::DEAD_ZONE.powi(2)
     }
 }
 
@@ -569,7 +612,7 @@ unsafe fn run_instance() -> Result<(), String> {
             } else if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
                 app.key_down(message.wParam as u32)
             } else if matches!(message.message, WM_KEYUP | WM_SYSKEYUP) {
-                app.key_up(message.wParam as u32);
+                app.key_up(message.wParam as u32, message.pt);
                 false
             } else {
                 false
@@ -1475,14 +1518,15 @@ impl App {
             state: WheelState {
                 stage: WheelStage::Actions,
                 hover: None,
-                committed: None,
+                back_available: false,
                 primary: self.primary(),
                 secondary: self.secondary(),
                 interactive: self.interactive,
                 tool: self.tool,
             },
             renderer,
-            dwell: HoverDwell::default(),
+            navigation: RadialNavigation::default(),
+            escape_down: GetAsyncKeyState(VK_ESCAPE as i32) < 0,
         });
         if !self.render_radial() {
             return;
@@ -1551,15 +1595,19 @@ impl App {
     }
 
     unsafe fn poll_radial(&mut self) {
-        let Some(hold) = self.radial_hold.as_ref() else {
+        let Some(hold) = self.radial_hold.as_mut() else {
             KillTimer(self.toolbar, TIMER_RADIAL);
             return;
         };
-        if GetAsyncKeyState(hold.key as i32) >= 0 {
+        let escape_down = GetAsyncKeyState(VK_ESCAPE as i32) < 0;
+        let cancel = escape_down && !hold.escape_down;
+        hold.escape_down = escape_down;
+        if cancel {
             self.close_radial();
             return;
         }
-        if hold.state.committed.is_some() {
+        if GetAsyncKeyState(hold.key as i32) >= 0 {
+            self.finish_radial(None);
             return;
         }
         let mut cursor = POINT::default();
@@ -1568,80 +1616,76 @@ impl App {
             return;
         }
         let hold = self.radial_hold.as_mut().unwrap();
-        let candidate = radial::hit_test(
+        let dx = (cursor.x as f64 - hold.center.x as f64) as f32 / hold.scale;
+        let dy = (cursor.y as f64 - hold.center.y as f64) as f32 / hold.scale;
+        let distance_squared = dx * dx + dy * dy;
+        let candidate = radial::hit_test(hold.state.stage, dx, dy);
+        let destination = hold.navigation.sample(
             hold.state.stage,
-            (cursor.x - hold.center.x) as f32 / hold.scale,
-            (cursor.y - hold.center.y) as f32 / hold.scale,
+            candidate,
+            distance_squared,
+            Instant::now(),
         );
-        let changed = hold.state.hover != candidate;
+        let back_available = hold
+            .navigation
+            .back_available(hold.state.stage, distance_squared);
+        let changed = hold.state.hover != candidate || hold.state.back_available != back_available;
         hold.state.hover = candidate;
-        let selected = hold.dwell.sample(candidate, Instant::now());
-        if let Some(index) = selected {
-            self.commit_radial(index);
+        hold.state.back_available = back_available;
+        if let Some(stage) = destination {
+            hold.state.stage = stage;
+            hold.state.hover = None;
+            hold.state.back_available = false;
+            hold.navigation = RadialNavigation::default();
+            if self.center_radial_pointer() {
+                self.render_radial();
+            }
         } else if changed {
             self.render_radial();
         }
     }
 
-    unsafe fn commit_radial(&mut self, index: usize) {
-        let Some(hold) = self.radial_hold.as_mut() else {
+    unsafe fn finish_radial(&mut self, release_position: Option<POINT>) {
+        KillTimer(self.toolbar, TIMER_RADIAL);
+        let Some(hold) = self.radial_hold.take() else {
             return;
         };
-        if hold.state.committed.is_some() {
-            return;
-        }
-        if hold.state.stage == WheelStage::Actions && index == 3 {
-            hold.state.stage = WheelStage::Colors;
-            hold.state.hover = None;
-            hold.dwell = HoverDwell::default();
-            if !self.center_radial_pointer() {
-                return;
-            }
-            self.render_radial();
-            return;
-        }
-        let stage = hold.state.stage;
-        let color = if stage == WheelStage::Colors {
-            radial::colors(hold.state.primary, hold.state.secondary)
-                .get(index)
-                .copied()
-        } else {
-            None
+        ShowWindow(self.radial_window, SW_HIDE);
+        self.update_cursor();
+        // Another app can own keyboard focus. Its key release is observed by
+        // polling, whereas our own queued key releases carry their screen point.
+        let mut cursor = POINT::default();
+        let position = match release_position {
+            Some(point) => Some(point),
+            None if GetCursorPos(&mut cursor) != 0 => Some(cursor),
+            None => None,
         };
-        hold.state.committed = Some(index);
-        match stage {
-            WheelStage::Actions => match index {
-                // The wheel switches from any drawing tool back to the mouse.
-                0 => self.select_tool(Tool::Pen, !self.interactive),
-                1 => {
-                    self.ink.clear();
-                    self.render(None);
-                }
-                2 => self.select_tool(Tool::ObjectEraser, true),
-                _ => {}
-            },
-            WheelStage::Colors => {
-                if let Some(color) = color {
-                    self.settings.primary_color = color.to_hex();
-                    self.hsv = ui::rgb_to_hsv(self.edited_color());
-                    self.sync_edits(None);
-                    self.save_later();
-                    self.redraw_ui();
-                }
-            }
+        if GetAsyncKeyState(VK_ESCAPE as i32) < 0 && !hold.escape_down {
+            return;
         }
-        // Ink activation can change topmost ordering; the held wheel stays above it.
-        SetWindowPos(
-            self.radial_window,
-            HWND_TOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
-        SetCursor(LoadCursorW(ptr::null_mut(), IDC_ARROW));
-        self.render_radial();
+        let Some(position) = position else {
+            return;
+        };
+        let dx = (position.x as f64 - hold.center.x as f64) as f32 / hold.scale;
+        let dy = (position.y as f64 - hold.center.y as f64) as f32 / hold.scale;
+        match hold.state.selection_at(dx, dy) {
+            Some(radial::Selection::TogglePen) => {
+                self.select_tool(Tool::Pen, !self.interactive);
+            }
+            Some(radial::Selection::Clear) => {
+                self.ink.clear();
+                self.render(None);
+            }
+            Some(radial::Selection::ObjectEraser) => self.select_tool(Tool::ObjectEraser, true),
+            Some(radial::Selection::Color(color)) => {
+                self.settings.primary_color = color.to_hex();
+                self.hsv = ui::rgb_to_hsv(self.edited_color());
+                self.sync_edits(None);
+                self.save_later();
+                self.redraw_ui();
+            }
+            None => {}
+        }
     }
 
     unsafe fn stop_hold(&mut self) {
@@ -1973,13 +2017,13 @@ impl App {
         KillTimer(self.toolbar, TIMER_CAPTURE_RELEASE);
     }
 
-    unsafe fn key_up(&mut self, key: u32) {
+    unsafe fn key_up(&mut self, key: u32, release_position: POINT) {
         if self
             .radial_hold
             .as_ref()
             .is_some_and(|hold| hold.key == key)
         {
-            self.close_radial();
+            self.finish_radial(Some(release_position));
         }
         if self.pending_shortcut_release == Some(key) {
             self.clear_pending_shortcut();
@@ -1996,6 +2040,10 @@ impl App {
     }
 
     unsafe fn key_down(&mut self, key: u32) -> bool {
+        if self.radial_hold.is_some() && key == VK_ESCAPE as u32 {
+            self.close_radial();
+            return true;
+        }
         if self.toolbar_drag.is_some() && key == VK_ESCAPE as u32 {
             self.finish_toolbar_drag();
             return true;
@@ -3436,13 +3484,14 @@ mod tests {
     }
 
     #[test]
-    fn radial_hover_requires_stability_and_only_commits_once() {
+    fn radial_color_navigation_requires_a_stable_hover() {
         let start = Instant::now();
         let mut dwell = HoverDwell::default();
-        assert_eq!(dwell.sample(Some(1), start), None);
-        assert_eq!(dwell.sample(Some(1), start + RADIAL_DWELL / 2), None);
-        assert_eq!(dwell.sample(Some(1), start + RADIAL_DWELL), Some(1));
-        assert_eq!(dwell.sample(Some(1), start + RADIAL_DWELL * 10), None);
+        let delay = RADIAL_COLORS_DWELL;
+        assert_eq!(dwell.sample(Some(3), start, delay), None);
+        assert_eq!(dwell.sample(Some(3), start + delay / 2, delay), None);
+        assert_eq!(dwell.sample(Some(3), start + delay, delay), Some(3));
+        assert_eq!(dwell.sample(Some(3), start + delay * 10, delay), None);
     }
 
     #[test]
@@ -3466,17 +3515,126 @@ mod tests {
     }
 
     #[test]
-    fn radial_hub_and_sector_changes_restart_selection_delay() {
+    fn radial_leaf_hover_is_provisional_and_reentering_colors_restarts_navigation() {
         let start = Instant::now();
-        let mut dwell = HoverDwell::default();
-        assert_eq!(dwell.sample(Some(3), start), None);
-        assert_eq!(dwell.sample(None, start + RADIAL_DWELL), None);
-        assert_eq!(dwell.sample(Some(3), start + RADIAL_DWELL * 2), None);
-        assert_eq!(dwell.sample(Some(0), start + RADIAL_DWELL * 3), None);
-        assert_eq!(dwell.sample(Some(0), start + RADIAL_DWELL * 4), Some(0));
-        // A new color page gets a fresh dwell, even at the same sector index.
-        dwell = HoverDwell::default();
-        assert_eq!(dwell.sample(Some(0), start + RADIAL_DWELL * 5), None);
+        let mut navigation = RadialNavigation::default();
+        let delay = RADIAL_COLORS_DWELL;
+        for index in 0..3 {
+            assert_eq!(
+                navigation.sample(WheelStage::Actions, Some(index), 10000.0, start),
+                None
+            );
+            assert_eq!(
+                navigation.sample(
+                    WheelStage::Actions,
+                    Some(index),
+                    10000.0,
+                    start + delay * 10
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            navigation.sample(WheelStage::Actions, Some(3), 10000.0, start),
+            None
+        );
+        assert_eq!(
+            navigation.sample(WheelStage::Actions, None, 0.0, start + delay),
+            None
+        );
+        assert_eq!(
+            navigation.sample(WheelStage::Actions, Some(3), 10000.0, start + delay * 2),
+            None
+        );
+        assert_eq!(
+            navigation.sample(WheelStage::Actions, Some(3), 10000.0, start + delay * 3),
+            Some(WheelStage::Colors)
+        );
+    }
+
+    #[test]
+    fn radial_colors_back_navigation_arms_only_after_leaving_the_center() {
+        let start = Instant::now();
+        let mut navigation = RadialNavigation::default();
+        assert_eq!(
+            navigation.sample(WheelStage::Colors, None, 0.0, start),
+            None
+        );
+        assert_eq!(
+            navigation.sample(
+                WheelStage::Colors,
+                None,
+                0.0,
+                start + Duration::from_secs(2)
+            ),
+            None
+        );
+        assert!(!navigation.back_available(WheelStage::Colors, 0.0));
+        let returned = start + Duration::from_secs(3);
+        assert_eq!(
+            navigation.sample(WheelStage::Colors, Some(4), 10000.0, returned),
+            None
+        );
+        assert_eq!(
+            navigation.sample(WheelStage::Colors, None, 0.0, returned),
+            None
+        );
+        assert!(navigation.back_available(WheelStage::Colors, 0.0));
+        assert_eq!(
+            navigation.sample(
+                WheelStage::Colors,
+                None,
+                0.0,
+                returned + RADIAL_BACK_DWELL - Duration::from_millis(1)
+            ),
+            None
+        );
+        assert_eq!(
+            navigation.sample(WheelStage::Colors, None, 0.0, returned + RADIAL_BACK_DWELL),
+            Some(WheelStage::Actions)
+        );
+        // The host resets navigation when either page changes and recenters.
+        navigation = RadialNavigation::default();
+        assert_eq!(
+            navigation.sample(
+                WheelStage::Actions,
+                None,
+                0.0,
+                returned + Duration::from_secs(1)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn radial_colors_back_navigation_resets_when_the_pointer_leaves_the_hub() {
+        let start = Instant::now();
+        let mut navigation = RadialNavigation::default();
+        navigation.sample(WheelStage::Colors, Some(0), 10000.0, start);
+        navigation.sample(WheelStage::Colors, None, 0.0, start);
+        let interrupted = start + RADIAL_BACK_DWELL / 2;
+        assert_eq!(
+            navigation.sample(WheelStage::Colors, None, 2500.0, interrupted),
+            None
+        );
+        assert!(!navigation.back_available(WheelStage::Colors, 2500.0));
+        assert_eq!(
+            navigation.sample(WheelStage::Colors, None, 0.0, interrupted),
+            None
+        );
+        assert_eq!(
+            navigation.sample(WheelStage::Colors, None, 0.0, start + RADIAL_BACK_DWELL),
+            None
+        );
+        assert_eq!(
+            navigation.sample(
+                WheelStage::Colors,
+                None,
+                0.0,
+                interrupted + RADIAL_BACK_DWELL
+            ),
+            Some(WheelStage::Actions)
+        );
     }
 
     #[test]
