@@ -18,6 +18,7 @@ use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
     UI::{
+        Controls::{DRAWITEMSTRUCT, ODS_FOCUS, ODS_SELECTED},
         HiDpi::GetDpiForWindow,
         Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE},
         WindowsAndMessaging::*,
@@ -29,7 +30,8 @@ const POLL_TIMER: usize = 1;
 const SKIP_BUTTON: usize = 2;
 const CHECK_LIMIT: Duration = Duration::from_secs(10);
 const SPLASH_MINIMUM: Duration = Duration::from_millis(350);
-const DOWNLOAD_MINIMUM: Duration = Duration::from_millis(1200);
+const STARTUP_DOWNLOAD_MINIMUM: Duration = Duration::from_secs(5);
+const MANUAL_DOWNLOAD_MINIMUM: Duration = Duration::from_millis(1200);
 pub const INSTALL_POLL_MS: u32 = 50;
 const RESTART_ARG: &str = "--after-update";
 
@@ -95,7 +97,7 @@ pub unsafe fn run(settings: &Settings, instance: HINSTANCE) -> Launch {
     let version = release.version.clone();
     window.set_stage(Stage::Downloading);
     let result = match worker(move || install_update::stage(&asset, &version)) {
-        Ok(receiver) => window.wait(&receiver, Instant::now() + DOWNLOAD_MINIMUM, None),
+        Ok(receiver) => window.wait(&receiver, Instant::now() + STARTUP_DOWNLOAD_MINIMUM, None),
         Err(_) => Wait::Failed,
     };
     let install = match result {
@@ -183,7 +185,7 @@ impl Installation {
         window.show();
         Ok(Self {
             window,
-            work: InstallWork::Downloading(receiver, Instant::now() + DOWNLOAD_MINIMUM),
+            work: InstallWork::Downloading(receiver, Instant::now() + MANUAL_DOWNLOAD_MINIMUM),
         })
     }
 
@@ -211,7 +213,7 @@ impl Installation {
         }
         match &self.work {
             InstallWork::Downloading(receiver, ready_at) => {
-                if Instant::now() < *ready_at {
+                if !self.window.can_finish_download(*ready_at) {
                     return None;
                 }
                 let staged = match receive_install_result(receiver)? {
@@ -257,6 +259,7 @@ struct WindowState {
     stage: Cell<Stage>,
     skipped: Cell<bool>,
     ending_session: Cell<bool>,
+    action: &'static str,
 }
 
 struct Window {
@@ -283,6 +286,11 @@ impl Window {
             stage: Cell::new(Stage::Checking),
             skipped: Cell::new(false),
             ending_session: Cell::new(false),
+            action: if owner.is_null() {
+                "Skip for now"
+            } else {
+                "Cancel"
+            },
         });
         let monitor = if owner.is_null() {
             let mut cursor = POINT::default();
@@ -348,20 +356,16 @@ impl Window {
         if !region.is_null() && SetWindowRgn(handle, region, 1) == 0 {
             DeleteObject(region);
         }
+        let (button_x, button_y, button_width, button_height) = splash::ACTION;
         window.button = CreateWindowExW(
             0,
             wide("BUTTON").as_ptr(),
-            wide(if owner.is_null() {
-                "Skip for now"
-            } else {
-                "Cancel"
-            })
-            .as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32,
-            px(222),
-            px(106),
-            px(114),
-            px(28),
+            wide(window.state.action).as_ptr(),
+            WS_CHILD | WS_TABSTOP | BS_OWNERDRAW as u32,
+            px(button_x),
+            px(button_y),
+            px(button_x + button_width) - px(button_x),
+            px(button_y + button_height) - px(button_y),
             handle,
             SKIP_BUTTON as HMENU,
             instance,
@@ -370,18 +374,14 @@ impl Window {
         if window.button.is_null() {
             return None;
         }
-        SendMessageW(
-            window.button,
-            WM_SETFONT,
-            GetStockObject(DEFAULT_GUI_FONT) as usize,
-            0,
-        );
         Some(window)
     }
 
     unsafe fn show(&self) {
         ShowWindow(self.handle, SW_SHOW);
-        SetFocus(self.button);
+        if self.state.stage.get() == Stage::Downloading {
+            SetFocus(self.button);
+        }
         UpdateWindow(self.handle);
     }
 
@@ -391,11 +391,21 @@ impl Window {
             self.handle,
             wide(&format!("Study Pen — {}", stage.status())).as_ptr(),
         );
-        if stage == Stage::Installing {
+        if stage == Stage::Downloading {
+            ShowWindow(self.button, SW_SHOWNA);
+            if IsWindowVisible(self.handle) != 0 {
+                SetFocus(self.button);
+            }
+        } else {
             ShowWindow(self.button, SW_HIDE);
         }
         InvalidateRect(self.handle, ptr::null(), 0);
         UpdateWindow(self.handle);
+    }
+
+    unsafe fn can_finish_download(&self, not_before: Instant) -> bool {
+        Instant::now() >= not_before
+            && (SendMessageW(self.button, BM_GETSTATE, 0, 0) & BST_PUSHED as isize) == 0
     }
 
     unsafe fn wait<T>(
@@ -412,7 +422,12 @@ impl Window {
                 return Wait::Skipped;
             }
             let now = Instant::now();
-            if now >= not_before {
+            let ready = if self.state.stage.get() == Stage::Downloading {
+                self.can_finish_download(not_before)
+            } else {
+                now >= not_before
+            };
+            if ready {
                 match receiver.try_recv() {
                     Ok(result) => return Wait::Ready(result),
                     Err(TryRecvError::Disconnected) => return Wait::Failed,
@@ -473,6 +488,19 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_ERASEBKGND => 1,
+        WM_DRAWITEM if wparam == SKIP_BUTTON => {
+            if let Some(item) = (lparam as *const DRAWITEMSTRUCT).as_ref() {
+                splash::paint_action(
+                    item.hDC,
+                    item.rcItem,
+                    state.scale.get(),
+                    state.action,
+                    item.itemState & ODS_SELECTED != 0,
+                    item.itemState & ODS_FOCUS != 0,
+                );
+            }
+            1
+        }
         WM_CLOSE => {
             if state.stage.get() != Stage::Installing {
                 state.skipped.set(true);
@@ -480,7 +508,7 @@ unsafe extern "system" fn window_proc(
             0
         }
         WM_COMMAND if wparam == SKIP_BUTTON => {
-            if state.stage.get() != Stage::Installing {
+            if state.stage.get() == Stage::Downloading {
                 state.skipped.set(true);
             }
             0
@@ -512,7 +540,25 @@ mod tests {
         unsafe {
             let window = Window::new(GetModuleHandleW(ptr::null()), ptr::null_mut())
                 .expect("create startup window");
+            let action_visible =
+                || GetWindowLongPtrW(window.button, GWL_STYLE) & WS_VISIBLE as isize != 0;
+            assert!(!action_visible());
+            SendMessageW(
+                window.handle,
+                WM_COMMAND,
+                SKIP_BUTTON,
+                window.button as isize,
+            );
+            assert!(!window.state.skipped.get());
+
             window.set_stage(Stage::Downloading);
+            assert!(action_visible());
+            assert!(!window.can_finish_download(Instant::now() + STARTUP_DOWNLOAD_MINIMUM));
+            SendMessageW(window.button, BM_SETSTATE, 1, 0);
+            assert!(!window.can_finish_download(Instant::now()));
+            SendMessageW(window.button, BM_SETSTATE, 0, 0);
+            assert!(window.can_finish_download(Instant::now()));
+
             SendMessageW(
                 window.handle,
                 WM_COMMAND,
@@ -528,6 +574,7 @@ mod tests {
 
             window.state.skipped.set(false);
             window.set_stage(Stage::Installing);
+            assert!(!action_visible());
             SendMessageW(
                 window.handle,
                 WM_COMMAND,
@@ -554,7 +601,7 @@ mod tests {
             sender.send(Err("Download failed.".into())).unwrap();
             let mut install = Installation {
                 window,
-                work: InstallWork::Downloading(receiver, Instant::now() + DOWNLOAD_MINIMUM),
+                work: InstallWork::Downloading(receiver, Instant::now() + MANUAL_DOWNLOAD_MINIMUM),
             };
             assert!(install.poll().is_none());
             let key = MSG {

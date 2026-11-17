@@ -1,3 +1,4 @@
+use crate::toolbar_preferences::{self, ToolbarButton, ToolbarTheme};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{
     cell::RefCell,
@@ -223,6 +224,12 @@ pub struct Settings {
     pub desktop_shortcut_seen: bool,
     #[serde(default)]
     pub toolbar_vertical: bool,
+    #[serde(deserialize_with = "toolbar_preferences::deserialize_theme")]
+    pub toolbar_theme: ToolbarTheme,
+    #[serde(deserialize_with = "toolbar_preferences::deserialize_labels")]
+    pub toolbar_labels: bool,
+    #[serde(deserialize_with = "toolbar_preferences::deserialize_buttons")]
+    pub toolbar_buttons: Vec<ToolbarButton>,
     #[serde(skip)]
     storage: RefCell<Storage>,
     #[serde(skip)]
@@ -286,6 +293,9 @@ impl Default for Settings {
             toolbar_visible: true,
             desktop_shortcut_seen: false,
             toolbar_vertical: false,
+            toolbar_theme: ToolbarTheme::default(),
+            toolbar_labels: false,
+            toolbar_buttons: toolbar_preferences::default_buttons(),
             storage: RefCell::default(),
             hotkey_notice: None,
         }
@@ -488,6 +498,7 @@ impl Settings {
     }
 
     pub fn normalize(&mut self) {
+        toolbar_preferences::sanitize_buttons(&mut self.toolbar_buttons);
         let defaults = Self::default();
         let previous_hotkeys = self.hotkeys;
         if self.hotkey_default_revision == 0 {
@@ -815,6 +826,83 @@ mod tests {
         assert_eq!(settings.hotkey_default_revision, 0);
         assert!(settings.check_for_updates);
         assert!(!settings.toolbar_vertical);
+        assert_eq!(settings.toolbar_theme, ToolbarTheme::LiquidGlass);
+        assert!(!settings.toolbar_labels);
+        assert_eq!(settings.toolbar_buttons, ToolbarButton::DEFAULT);
+    }
+
+    #[test]
+    fn damaged_toolbar_fields_preserve_other_preferences_and_known_button_order() {
+        let mut settings: Settings = serde_json::from_value(serde_json::json!({
+            "primary_color": "#123456",
+            "pen_width": 8.0,
+            "check_for_updates": false,
+            "toolbar_theme": "future_theme",
+            "toolbar_labels": "invalid",
+            "toolbar_buttons": ["ruler", "pen", "ruler", "future_button", null, 7, "fill"]
+        }))
+        .unwrap();
+        settings.normalize();
+        assert_eq!(settings.primary_color, "#123456");
+        assert_eq!(settings.pen_width, 8.0);
+        assert!(!settings.check_for_updates);
+        assert_eq!(settings.toolbar_theme, ToolbarTheme::LiquidGlass);
+        assert!(!settings.toolbar_labels);
+        assert_eq!(
+            settings.toolbar_buttons,
+            [
+                ToolbarButton::Ruler,
+                ToolbarButton::Pen,
+                ToolbarButton::Fill,
+                ToolbarButton::Settings,
+                ToolbarButton::Quit
+            ]
+        );
+        for damaged in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!(["future"]),
+        ] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "secondary_color": "#ABCDEF",
+                "toolbar_theme": 17,
+                "toolbar_buttons": damaged,
+            }))
+            .unwrap();
+            assert_eq!(settings.secondary_color, "#ABCDEF");
+            assert_eq!(settings.toolbar_theme, ToolbarTheme::LiquidGlass);
+            assert_eq!(settings.toolbar_buttons, ToolbarButton::DEFAULT);
+        }
+    }
+
+    #[test]
+    fn older_toolbar_preferences_append_quit_without_resetting_user_choices() {
+        let mut settings: Settings = serde_json::from_value(serde_json::json!({
+            "primary_color": "#123456",
+            "toolbar_theme": "liquid_air",
+            "toolbar_labels": true,
+            "toolbar_buttons": ["ruler", "settings", "fill", "pen"]
+        }))
+        .unwrap();
+        settings.normalize();
+        assert_eq!(
+            settings.toolbar_buttons,
+            [
+                ToolbarButton::Ruler,
+                ToolbarButton::Settings,
+                ToolbarButton::Fill,
+                ToolbarButton::Pen,
+                ToolbarButton::Quit
+            ]
+        );
+        assert_eq!(settings.primary_color, "#123456");
+        assert_eq!(settings.toolbar_theme, ToolbarTheme::LiquidAir);
+        assert!(settings.toolbar_labels);
+        let serialized = serde_json::to_value(&settings).unwrap();
+        assert_eq!(
+            serialized["toolbar_buttons"],
+            serde_json::json!(["ruler", "settings", "fill", "pen", "quit"])
+        );
     }
 
     #[test]
@@ -1170,6 +1258,15 @@ mod tests {
         settings.toolbar_visible = false;
         settings.toolbar_vertical = true;
         settings.desktop_shortcut_seen = true;
+        settings.toolbar_theme = ToolbarTheme::LiquidAir;
+        settings.toolbar_labels = true;
+        settings.toolbar_buttons = vec![
+            ToolbarButton::Fill,
+            ToolbarButton::Settings,
+            ToolbarButton::Ruler,
+            ToolbarButton::Pen,
+            ToolbarButton::Quit,
+        ];
         settings.save().unwrap();
         settings.primary_color = "#203040".into();
         settings.save().unwrap();
@@ -1188,11 +1285,20 @@ mod tests {
         assert!(!reloaded.toolbar_visible);
         assert!(reloaded.toolbar_vertical);
         assert!(reloaded.desktop_shortcut_seen);
+        assert_eq!(reloaded.toolbar_theme, ToolbarTheme::LiquidAir);
+        assert!(reloaded.toolbar_labels);
+        assert_eq!(reloaded.toolbar_buttons, settings.toolbar_buttons);
         let json: serde_json::Value =
             serde_json::from_slice(&fs::read(&portable).unwrap()).unwrap();
         assert_eq!(json["hotkeys"].as_array().unwrap().len(), 9);
         assert_eq!(json["hotkey_default_revision"], HOTKEY_DEFAULT_REVISION);
         assert_eq!(json["toolbar_vertical"], true);
+        assert_eq!(json["toolbar_theme"], "liquid_air");
+        assert_eq!(json["toolbar_labels"], true);
+        assert_eq!(
+            json["toolbar_buttons"],
+            serde_json::json!(["fill", "settings", "ruler", "pen", "quit"])
+        );
         assert!(json.get("storage").is_none());
         assert!(json.get("hotkey_notice").is_none());
         assert!(suffixed_path(&portable, ".bak").exists());

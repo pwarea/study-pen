@@ -92,6 +92,38 @@ pub enum Tool {
     Pen,
     Eraser,
     ObjectEraser,
+    Shape,
+    Fill,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShapeKind {
+    #[default]
+    Rectangle,
+    Ellipse,
+    Line,
+    Arrow,
+    Triangle,
+}
+
+impl ShapeKind {
+    pub const ALL: [Self; 5] = [
+        Self::Rectangle,
+        Self::Ellipse,
+        Self::Line,
+        Self::Arrow,
+        Self::Triangle,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Rectangle => "Rectangle",
+            Self::Ellipse => "Ellipse",
+            Self::Line => "Line",
+            Self::Arrow => "Arrow",
+            Self::Triangle => "Triangle",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -141,7 +173,31 @@ pub struct Stroke {
     pub points: Vec<Point>,
     pub color: Color,
     pub width: f32,
+    /// Closed shape outlines also carry their fill and local eraser cutouts.
+    pub closed: bool,
+    pub fill: Option<Color>,
+    pub erasures: Vec<EraseSweep>,
     bounds: Bounds,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EraseSweep {
+    pub from: Point,
+    pub to: Point,
+    pub radius: f32,
+}
+
+impl EraseSweep {
+    fn contains(self, point: Point) -> bool {
+        point_segment_distance_squared(point, self.from, self.to) <= self.radius * self.radius
+    }
+
+    fn contains_sweep(self, from: Point, to: Point, radius: f32) -> bool {
+        let remaining = self.radius - radius;
+        remaining >= 0.0
+            && point_segment_distance_squared(from, self.from, self.to) <= remaining * remaining
+            && point_segment_distance_squared(to, self.from, self.to) <= remaining * remaining
+    }
 }
 
 impl Stroke {
@@ -150,6 +206,9 @@ impl Stroke {
             points: vec![point],
             color,
             width,
+            closed: false,
+            fill: None,
+            erasures: Vec::new(),
             bounds: Bounds::at(point),
         }
     }
@@ -164,6 +223,9 @@ impl Stroke {
             points,
             color,
             width,
+            closed: false,
+            fill: None,
+            erasures: Vec::new(),
             bounds,
         }
     }
@@ -178,7 +240,13 @@ impl Stroke {
     }
 
     fn memory_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.points.capacity() * std::mem::size_of::<Point>()
+        std::mem::size_of::<Self>()
+            + self.points.capacity() * std::mem::size_of::<Point>()
+            + self.erasures.capacity() * std::mem::size_of::<EraseSweep>()
+    }
+
+    fn visible_at(&self, point: Point) -> bool {
+        !self.erasures.iter().any(|cut| cut.contains(point))
     }
 }
 
@@ -200,6 +268,11 @@ impl Undo {
 #[derive(Debug)]
 enum Gesture {
     Pen(Stroke),
+    Shape {
+        origin: Point,
+        kind: ShapeKind,
+        stroke: Stroke,
+    },
     Erase {
         tool: Tool,
         previous: Point,
@@ -229,7 +302,7 @@ impl Ink {
 
     pub fn active_stroke(&self) -> Option<&Stroke> {
         match &self.gesture {
-            Some(Gesture::Pen(stroke)) => Some(stroke),
+            Some(Gesture::Pen(stroke) | Gesture::Shape { stroke, .. }) => Some(stroke),
             _ => None,
         }
     }
@@ -250,17 +323,57 @@ impl Ink {
             return;
         }
         let width = width.clamp(0.5, 1024.0);
-        if tool == Tool::Pen {
-            self.gesture = Some(Gesture::Pen(Stroke::new(point, color, width)));
-        } else {
-            let before = self.erase(point, point, width * 0.5, tool, false);
-            self.gesture = Some(Gesture::Erase {
-                tool,
-                previous: point,
-                radius: width * 0.5,
-                before,
-            });
+        match tool {
+            Tool::Pen => self.gesture = Some(Gesture::Pen(Stroke::new(point, color, width))),
+            Tool::Shape => self.begin_shape(point, ShapeKind::Rectangle, color, width),
+            Tool::Fill => {
+                self.fill_at(point, color);
+            }
+            Tool::Eraser | Tool::ObjectEraser => {
+                let before = self.erase(point, point, width * 0.5, tool, false);
+                self.gesture = Some(Gesture::Erase {
+                    tool,
+                    previous: point,
+                    radius: width * 0.5,
+                    before,
+                });
+            }
         }
+    }
+
+    /// Starts a shape preview. Dragging changes its geometry, not the scene;
+    /// release commits exactly one object and cancellation discards the preview.
+    pub fn begin_shape(&mut self, point: Point, kind: ShapeKind, color: Color, width: f32) {
+        self.end();
+        if !point.is_finite() || !width.is_finite() {
+            return;
+        }
+        self.gesture = Some(Gesture::Shape {
+            origin: point,
+            kind,
+            stroke: shape_stroke(point, point, kind, color, width.clamp(0.5, 1024.0)),
+        });
+    }
+
+    /// Fills the topmost closed shape beneath the pointer. An already matching
+    /// fill or a click in an erased hole is a no-op and creates no undo entry.
+    pub fn fill_at(&mut self, point: Point, color: Color) -> Option<Bounds> {
+        self.end();
+        if !point.is_finite() {
+            return None;
+        }
+        let index = self.strokes.iter().rposition(|stroke| {
+            stroke.closed && polygon_contains(&stroke.points, point) && stroke.visible_at(point)
+        })?;
+        if self.strokes[index].fill == Some(color) {
+            return None;
+        }
+        let before = self.strokes.clone();
+        let stroke = &mut self.strokes[index];
+        stroke.fill = Some(color);
+        let bounds = stroke.bounds();
+        self.push_undo(Undo::Restore(before));
+        Some(bounds)
     }
 
     pub fn extend(&mut self, point: Point) {
@@ -276,6 +389,13 @@ impl Ink {
                 if previous.distance_squared(point) >= POINT_SPACING.powi(2) {
                     stroke.append(point);
                 }
+            }
+            Gesture::Shape {
+                origin,
+                kind,
+                stroke,
+            } => {
+                *stroke = shape_stroke(*origin, point, *kind, stroke.color, stroke.width);
             }
             Gesture::Erase {
                 tool,
@@ -301,6 +421,14 @@ impl Ink {
                 stroke.points.shrink_to_fit();
                 self.strokes.push(stroke);
                 self.push_undo(Undo::RemoveLast);
+            }
+            Some(Gesture::Shape { mut stroke, .. }) => {
+                // A stationary shape gesture is not an accidental pen dot.
+                if stroke.points.len() > 1 {
+                    stroke.points.shrink_to_fit();
+                    self.strokes.push(stroke);
+                    self.push_undo(Undo::RemoveLast);
+                }
             }
             Some(Gesture::Erase {
                 before: Some(before),
@@ -390,8 +518,19 @@ impl Ink {
             // by the newly exposed ends of the surviving vector fragments.
             let cut_radius = radius + stroke.width * 0.5;
             if tool == Tool::ObjectEraser {
-                if stroke_hits_capsule(stroke, from, to, cut_radius) {
+                if stroke_hits_capsule(stroke, from, to, radius) {
                     changed.push((index, Vec::new()));
+                }
+            } else if stroke.closed {
+                if stroke_hits_capsule(stroke, from, to, radius)
+                    && !stroke
+                        .erasures
+                        .iter()
+                        .any(|cut| cut.contains_sweep(from, to, radius))
+                {
+                    let mut erased = stroke.clone();
+                    append_eraser_sweep(&mut erased.erasures, EraseSweep { from, to, radius });
+                    changed.push((index, vec![erased]));
                 }
             } else if let Some(fragments) = clip_stroke(stroke, from, to, cut_radius) {
                 changed.push((index, fragments));
@@ -433,14 +572,163 @@ pub fn eraser_diameter(initial: f32, vertical_delta: f32) -> f32 {
     (initial * (-travel / 100.0).exp()).clamp(MIN_ERASER_DIAMETER, MAX_ERASER_DIAMETER)
 }
 
-fn stroke_hits_capsule(stroke: &Stroke, from: Point, to: Point, radius: f32) -> bool {
-    if stroke.points.len() == 1 {
-        return point_segment_distance_squared(stroke.points[0], from, to) <= radius * radius;
+fn shape_stroke(origin: Point, end: Point, kind: ShapeKind, color: Color, width: f32) -> Stroke {
+    if origin.distance_squared(end) < POINT_SPACING * POINT_SPACING {
+        return Stroke::new(origin, color, width);
     }
+    let left = origin.x.min(end.x);
+    let right = origin.x.max(end.x);
+    let top = origin.y.min(end.y);
+    let bottom = origin.y.max(end.y);
+    let center = Point::new(left * 0.5 + right * 0.5, top * 0.5 + bottom * 0.5);
+    let mut closed = false;
+    let points = match kind {
+        ShapeKind::Rectangle | ShapeKind::Ellipse | ShapeKind::Triangle
+            if right - left < POINT_SPACING || bottom - top < POINT_SPACING =>
+        {
+            vec![origin, end]
+        }
+        ShapeKind::Rectangle => {
+            closed = true;
+            vec![
+                Point::new(left, top),
+                Point::new(right, top),
+                Point::new(right, bottom),
+                Point::new(left, bottom),
+                Point::new(left, top),
+            ]
+        }
+        ShapeKind::Ellipse => {
+            closed = true;
+            let rx = right * 0.5 - left * 0.5;
+            let ry = bottom * 0.5 - top * 0.5;
+            // A quarter-pixel chord error keeps large ellipses smooth without
+            // allocating points proportional to their screen-sized perimeter.
+            let segments = (std::f32::consts::PI * (rx.max(ry) / 0.5).sqrt())
+                .ceil()
+                .clamp(24.0, 512.0) as usize;
+            let mut points = Vec::with_capacity(segments + 1);
+            for index in 0..segments {
+                let angle = index as f32 * std::f32::consts::TAU / segments as f32;
+                points.push(Point::new(
+                    center.x + rx * angle.cos(),
+                    center.y + ry * angle.sin(),
+                ));
+            }
+            points.push(points[0]);
+            points
+        }
+        ShapeKind::Triangle => {
+            closed = true;
+            vec![
+                Point::new(center.x, top),
+                Point::new(right, bottom),
+                Point::new(left, bottom),
+                Point::new(center.x, top),
+            ]
+        }
+        ShapeKind::Line => vec![origin, end],
+        ShapeKind::Arrow => {
+            let dx = end.x - origin.x;
+            let dy = end.y - origin.y;
+            let length = dx.hypot(dy);
+            let head = (width * 3.0).clamp(10.0, 36.0).min(length * 0.45);
+            let ux = dx / length;
+            let uy = dy / length;
+            let base = Point::new(end.x - ux * head, end.y - uy * head);
+            vec![
+                origin,
+                end,
+                Point::new(base.x - uy * head * 0.55, base.y + ux * head * 0.55),
+                end,
+                Point::new(base.x + uy * head * 0.55, base.y - ux * head * 0.55),
+            ]
+        }
+    };
+    if !points.iter().all(|point| point.is_finite()) {
+        return Stroke::new(origin, color, width);
+    }
+    let mut stroke = Stroke::from_points(points, color, width);
+    stroke.closed = closed;
     stroke
-        .points
-        .windows(2)
-        .any(|pair| capsule_interval(pair[0], pair[1], from, to, radius).is_some())
+}
+
+fn polygon_contains(points: &[Point], point: Point) -> bool {
+    let mut inside = false;
+    for pair in points.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if point_segment_distance_squared(point, a, b) <= EPSILON * EPSILON {
+            return true;
+        }
+        if (a.y > point.y) != (b.y > point.y)
+            && point.x < (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x
+        {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+fn append_eraser_sweep(cuts: &mut Vec<EraseSweep>, next: EraseSweep) {
+    if let Some(last) = cuts.last_mut()
+        && last.radius == next.radius
+        && last.to == next.from
+    {
+        let ax = last.to.x - last.from.x;
+        let ay = last.to.y - last.from.y;
+        let bx = next.to.x - next.from.x;
+        let by = next.to.y - next.from.y;
+        if (ax * by - ay * bx).abs() <= EPSILON && ax * bx + ay * by >= 0.0 {
+            last.to = next.to;
+            return;
+        }
+    }
+    cuts.push(next);
+}
+
+fn stroke_hits_capsule(stroke: &Stroke, from: Point, to: Point, radius: f32) -> bool {
+    if stroke
+        .erasures
+        .iter()
+        .any(|cut| cut.contains_sweep(from, to, radius))
+    {
+        return false;
+    }
+    if stroke.fill.is_some() {
+        // The centerline test detects a sweep inside the shape, where no
+        // outline segment is touched. Boundary tests below handle crossings.
+        for point in [from, to, from.interpolate(to, 0.5)] {
+            if polygon_contains(&stroke.points, point) && stroke.visible_at(point) {
+                return true;
+            }
+            // A larger eraser can reach visible fill around an existing hole
+            // while its center remains inside that hole.
+            for index in 0..16 {
+                let angle = index as f32 * std::f32::consts::TAU / 16.0;
+                let edge = Point::new(
+                    point.x + radius * angle.cos(),
+                    point.y + radius * angle.sin(),
+                );
+                if polygon_contains(&stroke.points, edge) && stroke.visible_at(edge) {
+                    return true;
+                }
+            }
+        }
+    }
+    // Fill and existing holes use the actual eraser footprint. Only an outline
+    // needs its own half-width allowance when checking its centerline segments.
+    let outline_radius = radius + stroke.width * 0.5;
+    if stroke.points.len() == 1 {
+        return point_segment_distance_squared(stroke.points[0], from, to)
+            <= outline_radius * outline_radius;
+    }
+    stroke.points.windows(2).any(|pair| {
+        capsule_interval(pair[0], pair[1], from, to, outline_radius).is_some_and(|(low, high)| {
+            [low, (low + high) * 0.5, high]
+                .into_iter()
+                .any(|t| stroke.visible_at(pair[0].interpolate(pair[1], t)))
+        })
+    })
 }
 
 /// Returns fragments only when some positive-length part of the stroke is cut.
@@ -778,5 +1066,188 @@ mod tests {
         ink.extend(Point::new(4.0, f32::INFINITY));
         ink.end();
         assert_eq!(ink.strokes()[0].points.len(), 1);
+    }
+
+    fn rectangle(ink: &mut Ink, start: Point, finish: Point) {
+        ink.begin_shape(start, ShapeKind::Rectangle, RED, 4.0);
+        ink.extend(finish);
+        ink.end();
+    }
+
+    #[test]
+    fn shape_drag_replaces_its_preview_and_commits_one_object() {
+        let mut ink = Ink::new();
+        ink.begin_shape(Point::new(100.0, 90.0), ShapeKind::Rectangle, RED, 4.0);
+        ink.extend(Point::new(20.0, 10.0));
+        let preview = ink.active_stroke().unwrap();
+        assert!(preview.closed);
+        assert_eq!(preview.points.len(), 5);
+        assert_eq!(
+            preview.bounds(),
+            Bounds {
+                min_x: 18.0,
+                min_y: 8.0,
+                max_x: 102.0,
+                max_y: 92.0
+            }
+        );
+        ink.extend(Point::new(0.0, 0.0));
+        assert_eq!(ink.active_stroke().unwrap().points.len(), 5);
+        assert!(ink.strokes().is_empty());
+        ink.end();
+        assert_eq!(ink.strokes().len(), 1);
+        assert!(ink.undo());
+        assert!(!ink.undo());
+
+        ink.begin_shape(Point::new(4.0, 5.0), ShapeKind::Ellipse, RED, 4.0);
+        ink.end();
+        assert!(
+            ink.strokes().is_empty(),
+            "A shape tap must not leave an accidental dot"
+        );
+    }
+
+    #[test]
+    fn fill_targets_topmost_closed_shape_and_is_transactional() {
+        let blue = Color::rgb(20, 80, 255);
+        let mut ink = Ink::new();
+        rectangle(&mut ink, Point::new(0.0, 0.0), Point::new(120.0, 100.0));
+        rectangle(&mut ink, Point::new(20.0, 20.0), Point::new(80.0, 80.0));
+        let original = ink.strokes().to_vec();
+        assert_eq!(
+            ink.fill_at(Point::new(40.0, 40.0), blue),
+            Some(ink.strokes()[1].bounds())
+        );
+        assert_eq!(ink.strokes()[0].fill, None);
+        assert_eq!(ink.strokes()[1].fill, Some(blue));
+        assert!(ink.fill_at(Point::new(40.0, 40.0), blue).is_none());
+        assert!(ink.fill_at(Point::new(200.0, 40.0), blue).is_none());
+        assert!(ink.undo());
+        assert_eq!(ink.strokes(), original);
+        assert!(ink.undo());
+        assert_eq!(ink.strokes().len(), 1);
+    }
+
+    #[test]
+    fn pixel_eraser_cuts_filled_shape_interior_and_undo_restores_fill() {
+        let mut ink = Ink::new();
+        rectangle(&mut ink, Point::new(0.0, 0.0), Point::new(200.0, 160.0));
+        ink.fill_at(Point::new(80.0, 80.0), RED).unwrap();
+        let original = ink.strokes().to_vec();
+        ink.begin(Point::new(50.0, 80.0), Tool::Eraser, RED, 24.0);
+        ink.extend(Point::new(150.0, 80.0));
+        ink.end();
+        assert_eq!(ink.strokes().len(), 1);
+        assert_eq!(ink.strokes()[0].fill, Some(RED));
+        assert_eq!(
+            ink.strokes()[0].erasures.len(),
+            1,
+            "A straight sweep uses one compact capsule"
+        );
+        assert!(!ink.strokes()[0].visible_at(Point::new(100.0, 80.0)));
+        assert!(ink.strokes()[0].visible_at(Point::new(100.0, 110.0)));
+        assert!(
+            ink.fill_at(Point::new(100.0, 80.0), Color::default())
+                .is_none()
+        );
+        assert!(ink.undo());
+        assert_eq!(ink.strokes(), original);
+    }
+
+    #[test]
+    fn object_eraser_removes_filled_interior_but_respects_an_erased_hole() {
+        let mut ink = Ink::new();
+        rectangle(&mut ink, Point::new(0.0, 0.0), Point::new(200.0, 160.0));
+        ink.fill_at(Point::new(80.0, 80.0), RED).unwrap();
+        ink.begin(Point::new(100.0, 80.0), Tool::Eraser, RED, 40.0);
+        ink.end();
+        let cut = ink.strokes().to_vec();
+        ink.begin(Point::new(100.0, 80.0), Tool::ObjectEraser, RED, 8.0);
+        ink.end();
+        assert_eq!(ink.strokes(), cut);
+        ink.begin(Point::new(130.0, 80.0), Tool::ObjectEraser, RED, 8.0);
+        ink.end();
+        assert!(ink.strokes().is_empty());
+        assert!(ink.undo());
+        assert_eq!(ink.strokes(), cut);
+    }
+
+    #[test]
+    fn thick_outline_does_not_expand_object_eraser_inside_a_filled_hole() {
+        let mut ink = Ink::new();
+        ink.begin_shape(Point::new(0.0, 0.0), ShapeKind::Rectangle, RED, 40.0);
+        ink.extend(Point::new(300.0, 250.0));
+        ink.end();
+        let center = Point::new(150.0, 125.0);
+        ink.fill_at(center, RED).unwrap();
+        ink.begin(center, Tool::Eraser, RED, 80.0);
+        ink.end();
+        let cut = ink.strokes().to_vec();
+
+        // A 35-pixel-radius eraser fits wholly inside the 40-pixel hole. The
+        // outline's extra 20 pixels must not turn this into a false collision.
+        ink.begin(center, Tool::ObjectEraser, RED, 70.0);
+        ink.end();
+        assert_eq!(ink.strokes(), cut);
+        ink.begin(center, Tool::ObjectEraser, RED, 82.0);
+        ink.end();
+        assert!(
+            ink.strokes().is_empty(),
+            "A larger footprint reaches visible fill"
+        );
+        assert!(ink.undo());
+        assert_eq!(ink.strokes(), cut);
+        assert!(ink.undo());
+        assert!(
+            ink.strokes()[0].erasures.is_empty(),
+            "The missed eraser adds no undo action"
+        );
+    }
+
+    #[test]
+    fn shape_cancel_and_clear_preserve_undo_order() {
+        let mut ink = Ink::new();
+        rectangle(&mut ink, Point::new(0.0, 0.0), Point::new(80.0, 60.0));
+        ink.fill_at(Point::new(20.0, 20.0), RED).unwrap();
+        let original = ink.strokes().to_vec();
+        ink.begin(Point::new(30.0, 20.0), Tool::Eraser, RED, 10.0);
+        ink.cancel();
+        assert_eq!(ink.strokes(), original);
+        ink.begin_shape(Point::new(10.0, 10.0), ShapeKind::Triangle, RED, 3.0);
+        ink.extend(Point::new(200.0, 100.0));
+        ink.cancel();
+        assert_eq!(ink.strokes(), original);
+        ink.clear();
+        assert!(ink.undo());
+        assert_eq!(ink.strokes(), original);
+        assert!(ink.undo());
+        assert_eq!(ink.strokes()[0].fill, None);
+    }
+
+    #[test]
+    fn ellipse_and_triangle_fill_but_lines_and_arrows_remain_open() {
+        for kind in ShapeKind::ALL {
+            let mut ink = Ink::new();
+            ink.begin_shape(Point::new(-100.0, -80.0), kind, RED, 3.0);
+            ink.extend(Point::new(100.0, 80.0));
+            ink.end();
+            let closed = matches!(
+                kind,
+                ShapeKind::Rectangle | ShapeKind::Ellipse | ShapeKind::Triangle
+            );
+            assert_eq!(ink.strokes()[0].closed, closed, "{}", kind.label());
+            assert_eq!(
+                ink.fill_at(Point::new(0.0, 0.0), RED).is_some(),
+                closed,
+                "{}",
+                kind.label()
+            );
+            assert!(
+                ink.strokes()[0]
+                    .points
+                    .iter()
+                    .all(|point| point.is_finite())
+            );
+        }
     }
 }

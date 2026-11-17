@@ -66,8 +66,9 @@ fn side_gaps(proposed: Bounds, work: Bounds) -> Option<(i64, i64)> {
 
 /// Chooses orientation from the proposed horizontal toolbar's side gaps.
 ///
-/// The left side docks on overflow. The right side allows a short horizontal
-/// overhang before docking. Exact contact stays horizontal. Release layout when
+/// The left side docks on contact or overflow. The right side allows a short
+/// horizontal overhang before docking. A fit with fewer than two spare physical
+/// pixels stays horizontal on contact so a narrow monitor can release. Release when
 /// both ends fit inside with an eight-logical-pixel margin, reduced as needed
 /// so a narrow work area can still fit the full horizontal toolbar. A perfectly
 /// full-width fit has zero release margin and remains horizontal afterward.
@@ -92,7 +93,9 @@ pub fn choose_layout(
         ToolbarLayout::Horizontal => {
             let entry = ENTER_DISTANCE_DIP * f64::from(scale);
             let right_overhang = RIGHT_OVERHANG_DIP * f64::from(scale);
-            if (from_left as f64) < entry || (from_right as f64) <= -right_overhang {
+            let left_contact = (from_left as f64) <= entry && from_right > 1;
+            if (from_left as f64) < entry || left_contact || (from_right as f64) <= -right_overhang
+            {
                 ToolbarLayout::Vertical
             } else {
                 ToolbarLayout::Horizontal
@@ -135,7 +138,7 @@ mod tests {
         );
         assert_eq!(
             choose_layout(Horizontal, horizontal_at(0), PRIMARY, 1.0),
-            Horizontal
+            Vertical
         );
         assert_eq!(
             choose_layout(Horizontal, horizontal_at(1), PRIMARY, 1.0),
@@ -230,7 +233,7 @@ mod tests {
         );
         assert_eq!(
             choose_layout(Horizontal, horizontal_at(-2560), monitor, 1.0),
-            Horizontal
+            Vertical
         );
         assert_eq!(
             choose_layout(Horizontal, horizontal_at(-621), monitor, 1.0),
@@ -309,6 +312,19 @@ mod tests {
     }
 
     #[test]
+    fn left_contact_is_reachable_at_fractional_dpi_and_work_area_offsets() {
+        let work = Bounds::new(-1850, -100, 0, 980);
+        for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+            let width = (510.0 * scale).round() as i32;
+            let contact = Bounds::new(work.left, 100, work.left + width, 160);
+            assert_eq!(choose_layout(Horizontal, contact, work, scale), Vertical);
+            let inside = Bounds::new(contact.left + 1, 100, contact.right + 1, 160);
+            assert_eq!(choose_layout(Horizontal, inside, work, scale), Horizontal);
+            assert_eq!(choose_layout(Vertical, contact, work, scale), Vertical);
+        }
+    }
+
+    #[test]
     fn adaptive_margin_preserves_narrow_and_full_width_fits_without_oscillation() {
         let narrow = Bounds::new(0, 0, 634, 1040);
         assert_eq!(
@@ -324,6 +340,16 @@ mod tests {
         let released = choose_layout(Vertical, exact, full_width, 1.0);
         assert_eq!(released, Horizontal);
         assert_eq!(choose_layout(released, exact, full_width, 1.0), Horizontal);
+        let one_spare_pixel = Bounds::new(0, 0, 623, 1040);
+        for left in [0, 1] {
+            let fit = horizontal_at(left);
+            let released = choose_layout(Vertical, fit, one_spare_pixel, 1.0);
+            assert_eq!(released, Horizontal);
+            assert_eq!(
+                choose_layout(released, fit, one_spare_pixel, 1.0),
+                Horizontal
+            );
+        }
         assert_eq!(
             choose_layout(Horizontal, horizontal_at(-1), full_width, 1.0),
             Vertical

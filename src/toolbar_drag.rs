@@ -5,7 +5,10 @@
 //! the original normalized grab fractions and the now-unbounded pointer offset.
 //! Subsequent pointer deltas move the toolbar, rather than snapping it back.
 
-use crate::{docking::Bounds, ui::ToolbarLayout};
+use crate::{
+    docking::{Bounds, Edge},
+    ui::{ToolbarGeometry, ToolbarLayout},
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Point {
@@ -21,9 +24,11 @@ impl Point {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DragGeometry {
+    toolbar: ToolbarGeometry,
     pointer_anchor: Point,
     handle_anchor: (f64, f64),
     grab_fraction: (f64, f64),
+    left_handle_width: Option<f64>,
 }
 
 impl DragGeometry {
@@ -32,13 +37,13 @@ impl DragGeometry {
     pub fn begin(
         pointer: Point,
         actual: Bounds,
-        layout: ToolbarLayout,
+        toolbar: ToolbarGeometry,
         scale: f32,
     ) -> Option<Self> {
         if !valid_bounds(actual) {
             return None;
         }
-        let metrics = Metrics::scaled(layout, scale)?;
+        let metrics = Metrics::scaled(toolbar, scale)?;
         let grab_fraction = (
             ((f64::from(pointer.x) - f64::from(actual.left)) / metrics.handle_width)
                 .clamp(0.0, 1.0),
@@ -46,12 +51,14 @@ impl DragGeometry {
                 .clamp(0.0, 1.0),
         );
         Some(Self {
+            toolbar,
             pointer_anchor: pointer,
             handle_anchor: (
                 f64::from(actual.left) + grab_fraction.0 * metrics.handle_width,
                 f64::from(actual.top) + grab_fraction.1 * metrics.handle_height,
             ),
             grab_fraction,
+            left_handle_width: None,
         })
     }
 
@@ -82,11 +89,15 @@ impl DragGeometry {
         layout: ToolbarLayout,
         scale: f32,
     ) -> Option<Bounds> {
-        let metrics = Metrics::scaled(layout, scale)?;
+        let metrics = Metrics::scaled(self.toolbar.with_layout(layout), scale)?;
         let dx = (i64::from(pointer.x) - i64::from(self.pointer_anchor.x)) as f64;
         let dy = (i64::from(pointer.y) - i64::from(self.pointer_anchor.y)) as f64;
-        let left =
-            (self.handle_anchor.0 + dx - self.grab_fraction.0 * metrics.handle_width).round();
+        let handle_width = if layout == ToolbarLayout::Horizontal {
+            self.left_handle_width.unwrap_or(metrics.handle_width)
+        } else {
+            metrics.handle_width
+        };
+        let left = (self.handle_anchor.0 + dx - self.grab_fraction.0 * handle_width).round();
         let top =
             (self.handle_anchor.1 + dy - self.grab_fraction.1 * metrics.handle_height).round();
         let right = left + f64::from(metrics.width);
@@ -119,7 +130,7 @@ impl DragGeometry {
         if !valid_bounds(actual) {
             return false;
         }
-        let Some(metrics) = Metrics::scaled(layout, scale) else {
+        let Some(metrics) = Metrics::scaled(self.toolbar.with_layout(layout), scale) else {
             return false;
         };
         self.pointer_anchor = pointer;
@@ -127,6 +138,31 @@ impl DragGeometry {
             f64::from(actual.left) + self.grab_fraction.0 * metrics.handle_width,
             f64::from(actual.top) + self.grab_fraction.1 * metrics.handle_height,
         );
+        self.left_handle_width = match (layout, self.left_handle_width) {
+            (ToolbarLayout::Vertical, Some(_)) => Some(metrics.handle_width),
+            _ => None,
+        };
+        true
+    }
+
+    /// Align the left edge of the hypothetical horizontal footprint with a
+    /// left-docked column. Different handle widths must not count as a pull.
+    pub fn rebase_docked(
+        &mut self,
+        pointer: Point,
+        actual: Bounds,
+        scale: f32,
+        edge: Edge,
+    ) -> bool {
+        if !self.rebase(pointer, actual, ToolbarLayout::Vertical, scale) {
+            return false;
+        }
+        self.left_handle_width = if edge == Edge::Left {
+            Metrics::scaled(self.toolbar.with_layout(ToolbarLayout::Vertical), scale)
+                .map(|metrics| metrics.handle_width)
+        } else {
+            None
+        };
         true
     }
 }
@@ -143,7 +179,7 @@ struct Metrics {
 }
 
 impl Metrics {
-    fn scaled(layout: ToolbarLayout, scale: f32) -> Option<Self> {
+    fn scaled(layout: ToolbarGeometry, scale: f32) -> Option<Self> {
         if !scale.is_finite() || scale <= 0.0 {
             return None;
         }
@@ -178,8 +214,131 @@ mod tests {
     const DOCK_POINTER: Point = Point::new(1364, 230);
     const RIGHT_COLUMN: Bounds = Bounds::new(1860, 100, 1920, 580);
 
+    #[test]
+    fn left_docking_requires_a_real_pull_independent_of_handle_width_and_dpi() {
+        for labels in [false, true] {
+            let toolbar = ToolbarGeometry::new(
+                Horizontal,
+                &crate::toolbar_preferences::ToolbarButton::DEFAULT,
+                labels,
+            );
+            for scale in [1.0_f32, 1.25, 1.5, 2.0] {
+                let horizontal = Metrics::scaled(toolbar, scale).unwrap();
+                let vertical = Metrics::scaled(toolbar.with_layout(Vertical), scale).unwrap();
+                let work = Bounds::new(-1920, 0, 0, 2160);
+                for grab in [0.0, 0.577_777_8, 0.977_777_8] {
+                    let actual = Bounds::new(
+                        -1000,
+                        100,
+                        -1000 + horizontal.width,
+                        100 + horizontal.height,
+                    );
+                    let start = Point::new(
+                        actual.left + (horizontal.handle_width * grab).round() as i32,
+                        120,
+                    );
+                    let mut drag = DragGeometry::begin(start, actual, toolbar, scale).unwrap();
+                    let pointer = Point::new(work.left, 150);
+                    let column = Bounds::new(
+                        work.left,
+                        100,
+                        work.left + vertical.width,
+                        100 + vertical.height,
+                    );
+                    assert!(drag.rebase_docked(pointer, column, scale, Edge::Left));
+                    let same = drag.proposed_bounds(pointer, Horizontal, scale).unwrap();
+                    assert_eq!(same.left, work.left);
+                    assert_eq!(choose_layout(Vertical, same, work, scale), Vertical);
+                    assert_eq!(drag.proposed_bounds(pointer, Vertical, scale), Some(column));
+
+                    let down = Point::new(pointer.x, pointer.y + 30);
+                    let moved = drag.proposed_bounds(down, Horizontal, scale).unwrap();
+                    assert_eq!(moved.left, work.left);
+                    assert_eq!(moved.top, same.top + 30);
+                    assert_eq!(choose_layout(Vertical, moved, work, scale), Vertical);
+
+                    let release =
+                        (crate::docking::RELEASE_DISTANCE_DIP * f64::from(scale)).ceil() as i32;
+                    let before = drag
+                        .proposed_bounds(
+                            Point::new(pointer.x + release - 1, pointer.y),
+                            Horizontal,
+                            scale,
+                        )
+                        .unwrap();
+                    assert_eq!(choose_layout(Vertical, before, work, scale), Vertical);
+                    let after = drag
+                        .proposed_bounds(
+                            Point::new(pointer.x + release, pointer.y),
+                            Horizontal,
+                            scale,
+                        )
+                        .unwrap();
+                    assert_eq!(choose_layout(Vertical, after, work, scale), Horizontal);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_new_drag_on_the_left_column_keeps_the_leading_reference() {
+        let toolbar = ToolbarGeometry::new(
+            Vertical,
+            &crate::toolbar_preferences::ToolbarButton::DEFAULT,
+            true,
+        );
+        let metrics = Metrics::scaled(toolbar, 1.0).unwrap();
+        let column = Bounds::new(0, 100, metrics.width, 100 + metrics.height);
+        for x in [1, 26, 44, 80] {
+            let pointer = Point::new(x, 120);
+            let mut drag = DragGeometry::begin(pointer, column, toolbar, 1.0).unwrap();
+            drag.rebase_docked(pointer, column, 1.0, Edge::Left);
+            for dx in [0, 1, 2, 7] {
+                let proposal = drag
+                    .proposed_bounds(Point::new(x + dx, 140), Horizontal, 1.0)
+                    .unwrap();
+                assert_eq!(proposal.left, dx);
+                assert_eq!(choose_layout(Vertical, proposal, WORK, 1.0), Vertical);
+            }
+        }
+    }
+
+    #[test]
+    fn physical_left_limit_after_a_right_slide_can_seed_a_reachable_left_reference() {
+        let mut drag = horizontal_drag();
+        let right_pointer = Point::new(1364, 120);
+        drag.rebase_docked(right_pointer, RIGHT_COLUMN, 1.0, Edge::Right);
+        let physical_limit = Point::new(WORK.left, 120);
+        let unreachable = drag
+            .proposed_bounds(physical_limit, Horizontal, 1.0)
+            .unwrap();
+        assert!(unreachable.left > WORK.left);
+
+        let left_column = Bounds::new(0, 100, 60, 580);
+        drag.rebase_docked(physical_limit, left_column, 1.0, Edge::Left);
+        let proposal = drag
+            .proposed_bounds(physical_limit, Horizontal, 1.0)
+            .unwrap();
+        assert_eq!(proposal.left, WORK.left);
+        assert_eq!(choose_layout(Vertical, proposal, WORK, 1.0), Vertical);
+        let next = Point::new(10, 120);
+        assert_eq!(drag.proposed_bounds(next, Vertical, 1.0).unwrap().left, 10);
+        let horizontal = drag.proposed_bounds(next, Horizontal, 1.0).unwrap();
+        drag.rebase(next, horizontal, Horizontal, 1.0);
+        assert_eq!(
+            drag.proposed_bounds(next, Horizontal, 1.0),
+            Some(horizontal)
+        );
+    }
+
     fn horizontal_drag() -> DragGeometry {
-        DragGeometry::begin(INITIAL_POINTER, HORIZONTAL, Horizontal, 1.0).unwrap()
+        DragGeometry::begin(
+            INITIAL_POINTER,
+            HORIZONTAL,
+            ToolbarGeometry::default_for(Horizontal),
+            1.0,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -337,7 +496,13 @@ mod tests {
     fn negative_monitor_coordinates_and_fractional_dpi_preserve_physical_deltas() {
         let actual = Bounds::new(-1500, 100, -780, 190);
         let pointer = Point::new(-1473, 145);
-        let mut drag = DragGeometry::begin(pointer, actual, Horizontal, 1.5).unwrap();
+        let mut drag = DragGeometry::begin(
+            pointer,
+            actual,
+            ToolbarGeometry::default_for(Horizontal),
+            1.5,
+        )
+        .unwrap();
         assert_eq!(drag.proposed_bounds(pointer, Horizontal, 1.5), Some(actual));
         let docked = Bounds::new(-90, 0, 0, 720);
         let far_pointer = Point::new(-900, 200);
@@ -384,7 +549,15 @@ mod tests {
             f32::MAX,
             f32::MIN_POSITIVE,
         ] {
-            assert!(DragGeometry::begin(INITIAL_POINTER, HORIZONTAL, Horizontal, scale).is_none());
+            assert!(
+                DragGeometry::begin(
+                    INITIAL_POINTER,
+                    HORIZONTAL,
+                    ToolbarGeometry::default_for(Horizontal),
+                    scale
+                )
+                .is_none()
+            );
             assert!(
                 drag.proposed_bounds(INITIAL_POINTER, Horizontal, scale)
                     .is_none()
@@ -394,7 +567,15 @@ mod tests {
             assert_eq!(drag, before);
         }
         let invalid = Bounds::new(0, 0, 0, 1);
-        assert!(DragGeometry::begin(INITIAL_POINTER, invalid, Horizontal, 1.0).is_none());
+        assert!(
+            DragGeometry::begin(
+                INITIAL_POINTER,
+                invalid,
+                ToolbarGeometry::default_for(Horizontal),
+                1.0
+            )
+            .is_none()
+        );
         let before = drag;
         assert!(!drag.rebase(DOCK_POINTER, invalid, Vertical, 1.0));
         assert_eq!(drag, before);

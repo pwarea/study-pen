@@ -4,18 +4,22 @@ use crate::{
     docking::{self, Bounds, Edge},
     glass::Glass,
     hotkeys, identity,
-    ink::{Color, Ink, Point, Tool, eraser_diameter},
+    ink::{Color, Ink, Point, ShapeKind, Tool, eraser_diameter},
     overlay::{Rect, Renderer},
+    panel_material::PanelMaterial,
     radial::{self, WheelStage, WheelState},
     removal::{RemovalImage, RemovalPlan},
+    ruler::{Ruler, RulerSnap},
     settings::{Action, Hotkey, Settings},
     startup_update::{self, InstallResult, Installation, Launch},
     toolbar_drag::{DragGeometry, Point as DragPoint},
+    toolbar_editor::{self, Command as ToolbarCommand},
     toolbar_motion::DockAnimation,
+    toolbar_preferences::{self, ToolbarButton},
     tray::{self, Tray},
     ui::{
         self, PANEL_HEIGHT, PANEL_WIDTH, SHORTCUT_HEIGHT, SHORTCUT_STEP, SHORTCUT_TOP,
-        ToolbarControls, ToolbarLayout, UPDATE_ACTION_LEFT, UPDATE_BUTTON_BOTTOM,
+        ToolbarControls, ToolbarGeometry, ToolbarLayout, UPDATE_ACTION_LEFT, UPDATE_BUTTON_BOTTOM,
         UPDATE_BUTTON_TOP, UPDATE_CHECK_RIGHT, UiState,
     },
     updates::{self, ReleaseInfo, UpdateStatus},
@@ -23,7 +27,7 @@ use crate::{
 use std::{
     cell::RefCell,
     ffi::c_void,
-    mem::{size_of, zeroed},
+    mem::{offset_of, size_of, zeroed},
     ptr,
     sync::mpsc,
     time::{Duration, Instant},
@@ -35,8 +39,9 @@ use windows_sys::Win32::{
     UI::{
         Controls::{
             EM_SETLIMITTEXT, EM_SETSEL, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX,
-            InitCommonControlsEx, TOOLTIPS_CLASSW, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_NEWTOOLRECTW,
-            TTM_POP, TTS_ALWAYSTIP, TTTOOLINFOW, WM_MOUSELEAVE,
+            InitCommonControlsEx, TOOLTIPS_CLASSW, TTDT_INITIAL, TTDT_RESHOW, TTF_SUBCLASS,
+            TTM_ADDTOOLW, TTM_DELTOOLW, TTM_NEWTOOLRECTW, TTM_POP, TTM_SETDELAYTIME, TTS_ALWAYSTIP,
+            TTTOOLINFOW, WM_MOUSELEAVE,
         },
         HiDpi::*,
         Input::KeyboardAndMouse::*,
@@ -63,6 +68,7 @@ const DAILY_UPDATE_MS: u32 = 86_400_000;
 const GLASS_REFRESH_MS: u32 = 100;
 const REMOVE_REQUEST: u32 = WM_APP + 20;
 const UPDATE_REQUEST: u32 = WM_APP + 21;
+const SHAPE_REQUEST: u32 = WM_APP + 22;
 const RADIAL_COLORS_DWELL: Duration = Duration::from_millis(110);
 const RADIAL_BACK_DWELL: Duration = Duration::from_millis(250);
 const UNAVAILABLE_SHORTCUTS: &str = "Shortcut unavailable. Select its amber row to change it.";
@@ -92,11 +98,20 @@ struct RadialHold {
 
 struct ToolbarTips {
     window: HWND,
-    labels: [Vec<u16>; ui::TOOLBAR_TOOLTIPS.len()],
+    labels: [Vec<u16>; ToolbarButton::ALL.len()],
 }
 
 impl ToolbarTips {
-    unsafe fn new(toolbar: HWND, instance: HINSTANCE, layout: ToolbarLayout, scale: f32) -> Self {
+    const HOVER_DELAY_MS: isize = 450;
+    // TOOLINFO_V2_SIZE also works with the classic Windows common controls.
+    const TOOL_INFO_SIZE: u32 = offset_of!(TTTOOLINFOW, lpReserved) as u32;
+
+    unsafe fn new(
+        toolbar: HWND,
+        instance: HINSTANCE,
+        geometry: ToolbarGeometry,
+        scale: f32,
+    ) -> Self {
         InitCommonControlsEx(&INITCOMMONCONTROLSEX {
             dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
             dwICC: ICC_WIN95_CLASSES,
@@ -117,29 +132,41 @@ impl ToolbarTips {
         );
         let mut tips = Self {
             window,
-            labels: ui::TOOLBAR_TOOLTIPS.map(wide),
+            labels: ToolbarButton::ALL.map(|button| wide(button.label())),
         };
-        tips.set_bounds(toolbar, layout, scale, TTM_ADDTOOLW);
+        if !window.is_null() {
+            for delay in [TTDT_INITIAL, TTDT_RESHOW] {
+                SendMessageW(
+                    window,
+                    TTM_SETDELAYTIME,
+                    delay as usize,
+                    Self::HOVER_DELAY_MS,
+                );
+            }
+            tips.set_bounds(toolbar, geometry, scale, TTM_ADDTOOLW);
+        }
         tips
     }
 
     unsafe fn set_bounds(
         &mut self,
         toolbar: HWND,
-        layout: ToolbarLayout,
+        geometry: ToolbarGeometry,
         scale: f32,
         message: u32,
     ) {
-        if self.window.is_null() {
+        if self.window.is_null() || geometry.labels {
             return;
         }
         let px = |value: i32| (value as f32 * scale).round() as i32;
-        for (index, label) in self.labels.iter_mut().enumerate() {
-            let Some((x, y, w, h)) = layout.button_bounds(index) else {
+        for index in 0..geometry.len() {
+            let Some((x, y, w, h)) = geometry.button_bounds(index) else {
                 continue;
             };
+            let button = geometry.button(index).unwrap();
+            let label = &mut self.labels[button as usize];
             let tool = TTTOOLINFOW {
-                cbSize: size_of::<TTTOOLINFOW>() as u32,
+                cbSize: Self::TOOL_INFO_SIZE,
                 uFlags: TTF_SUBCLASS,
                 hwnd: toolbar,
                 uId: index + 1,
@@ -159,6 +186,28 @@ impl ToolbarTips {
                 &tool as *const TTTOOLINFOW as isize,
             );
         }
+    }
+
+    unsafe fn rebuild(&mut self, toolbar: HWND, geometry: ToolbarGeometry, scale: f32) {
+        if self.window.is_null() {
+            return;
+        }
+        self.hide();
+        for index in 0..ToolbarButton::ALL.len() {
+            let tool = TTTOOLINFOW {
+                cbSize: Self::TOOL_INFO_SIZE,
+                hwnd: toolbar,
+                uId: index + 1,
+                ..Default::default()
+            };
+            SendMessageW(
+                self.window,
+                TTM_DELTOOLW,
+                0,
+                &tool as *const TTTOOLINFOW as isize,
+            );
+        }
+        self.set_bounds(toolbar, geometry, scale, TTM_ADDTOOLW);
     }
 
     unsafe fn hide(&self) {
@@ -290,6 +339,11 @@ struct App {
     hotkey_errors: [Option<String>; 9],
     hover: Option<usize>,
     panel_drag: Option<PanelDrag>,
+    panel_material: Option<PanelMaterial>,
+    toolbar_edit_drag: Option<toolbar_editor::Drag>,
+    shape_kind: ShapeKind,
+    ruler: Option<Ruler>,
+    ruler_snap: Option<RulerSnap>,
     status: String,
     update_status: UpdateStatus,
     update_receiver: Option<mpsc::Receiver<UpdateStatus>>,
@@ -390,7 +444,12 @@ unsafe fn run_instance() -> Result<(), String> {
     } else {
         ToolbarLayout::Horizontal
     };
-    let (toolbar_width, toolbar_height) = toolbar_layout.size();
+    let toolbar_geometry = ToolbarGeometry::new(
+        toolbar_layout,
+        &settings.toolbar_buttons,
+        settings.toolbar_labels,
+    );
+    let (toolbar_width, toolbar_height) = toolbar_geometry.size();
     let origin = POINT {
         x: GetSystemMetrics(SM_XVIRTUALSCREEN),
         y: GetSystemMetrics(SM_YVIRTUALSCREEN),
@@ -424,7 +483,7 @@ unsafe fn run_instance() -> Result<(), String> {
         x: saved_x,
         y: saved_y,
     });
-    let toolbar_scale = fitted_toolbar_scale(toolbar_layout, scale, work);
+    let toolbar_scale = fitted_toolbar_scale(toolbar_geometry, scale, work);
     let toolbar_px = |n: i32| (n as f32 * toolbar_scale).round() as i32;
     let (x, y) = constrain_toolbar_position(
         saved_x,
@@ -529,7 +588,7 @@ unsafe fn run_instance() -> Result<(), String> {
         toolbar_animation: None,
         toolbar_clipped: false,
         glass: Glass::default(),
-        toolbar_tips: ToolbarTips::new(toolbar, instance, toolbar_layout, toolbar_scale),
+        toolbar_tips: ToolbarTips::new(toolbar, instance, toolbar_geometry, toolbar_scale),
         toolbar_pointer: None,
         renderer: None,
         settings,
@@ -552,6 +611,11 @@ unsafe fn run_instance() -> Result<(), String> {
         hotkey_errors: std::array::from_fn(|_| None),
         hover: None,
         panel_drag: None,
+        panel_material: None,
+        toolbar_edit_drag: None,
+        shape_kind: ShapeKind::Rectangle,
+        ruler: None,
+        ruler_snap: None,
         status: desktop_error
             .or(shortcut_error)
             .or(identity_error)
@@ -632,6 +696,98 @@ unsafe fn run_instance() -> Result<(), String> {
 }
 
 impl App {
+    fn toolbar_geometry(&self, layout: ToolbarLayout) -> ToolbarGeometry {
+        ToolbarGeometry::new(
+            layout,
+            &self.settings.toolbar_buttons,
+            self.settings.toolbar_labels,
+        )
+    }
+
+    unsafe fn toolbar_reconfigured(&mut self) {
+        self.finish_toolbar_drag();
+        self.toolbar_pointer = None;
+        self.hover = None;
+        let mut bounds = RECT::default();
+        if GetWindowRect(self.toolbar, &mut bounds) != 0 {
+            let work = monitor_work_area(POINT {
+                x: bounds.left,
+                y: bounds.top,
+            });
+            let geometry = self.toolbar_geometry(self.toolbar_layout);
+            let scale = fitted_toolbar_scale(geometry, self.scale, work);
+            let width = (geometry.size().0 as f32 * scale).round() as i32;
+            let x = if self.toolbar_layout == ToolbarLayout::Vertical && bounds.right == work.right
+            {
+                work.right - width
+            } else {
+                bounds.left
+            };
+            self.place_toolbar(x, bounds.top, work);
+            self.remember_toolbar();
+        }
+        let geometry = self.toolbar_geometry(self.toolbar_layout);
+        self.toolbar_tips
+            .rebuild(self.toolbar, geometry, self.toolbar_scale);
+        if !self
+            .settings
+            .toolbar_buttons
+            .contains(&ToolbarButton::Ruler)
+            && let Some(ruler) = &mut self.ruler
+        {
+            ruler.hide();
+        }
+        if IsWindowVisible(self.panel) != 0 {
+            let mut toolbar = RECT::default();
+            let mut panel = RECT::default();
+            if GetWindowRect(self.toolbar, &mut toolbar) != 0
+                && GetWindowRect(self.panel, &mut panel) != 0
+                && toolbar.left < panel.right
+                && panel.left < toolbar.right
+                && toolbar.top < panel.bottom
+                && panel.top < toolbar.bottom
+            {
+                self.place_panel();
+            }
+        }
+        self.save_later();
+        self.redraw_ui();
+    }
+
+    unsafe fn toggle_ruler(&mut self) {
+        self.finish_gesture();
+        if let Some(ruler) = &mut self.ruler
+            && ruler.is_visible()
+        {
+            ruler.hide();
+            self.redraw_ui();
+            return;
+        }
+        if self.ruler.is_none() {
+            match Ruler::new(GetModuleHandleW(ptr::null()), self.settings.toolbar_theme) {
+                Ok(ruler) => self.ruler = Some(ruler),
+                Err(error) => {
+                    self.status = error;
+                    self.redraw_ui();
+                    return;
+                }
+            }
+        }
+        let mut cursor = POINT::default();
+        GetCursorPos(&mut cursor);
+        let work = monitor_work_area(cursor);
+        let center = POINT {
+            x: work.left + (work.right - work.left) / 2,
+            y: work.top + (work.bottom - work.top) / 2,
+        };
+        if let Some(ruler) = &mut self.ruler
+            && let Err(error) = ruler.show_at(center)
+        {
+            self.status = error;
+        }
+        self.redraw_ui();
+    }
+
     fn primary(&self) -> Color {
         Color::from_hex(&self.settings.primary_color).unwrap_or_default()
     }
@@ -691,6 +847,10 @@ impl App {
             storage_message: self.settings.persistence_description(),
             pen_width: self.settings.pen_width,
             eraser_diameter: self.settings.eraser_diameter,
+            toolbar_theme: self.settings.toolbar_theme,
+            toolbar_labels: self.settings.toolbar_labels,
+            toolbar_buttons: self.settings.toolbar_buttons.clone(),
+            toolbar_edit_drag: self.toolbar_edit_drag,
         }
     }
 
@@ -703,10 +863,12 @@ impl App {
             return;
         }
         let controls = ToolbarControls {
-            layout: self.toolbar_layout,
+            geometry: self.toolbar_geometry(self.toolbar_layout),
+            theme: self.settings.toolbar_theme,
             interactive: self.interactive,
             tool: self.tool,
             primary: self.primary(),
+            ruler_visible: self.ruler.as_ref().is_some_and(Ruler::is_visible),
             hover: self.hover,
             dark: false,
         };
@@ -779,8 +941,9 @@ impl App {
     }
 
     unsafe fn place_toolbar(&mut self, x: i32, y: i32, work: RECT) {
-        let scale = fitted_toolbar_scale(self.toolbar_layout, self.scale, work);
-        let (width, height) = self.toolbar_layout.size();
+        let geometry = self.toolbar_geometry(self.toolbar_layout);
+        let scale = fitted_toolbar_scale(geometry, self.scale, work);
+        let (width, height) = geometry.size();
         let px = |n: i32| (n as f32 * scale).round() as i32;
         let (width, height) = (px(width), px(height));
         let (x, y) = constrain_toolbar_position(x, y, width, height, work);
@@ -793,7 +956,8 @@ impl App {
     }
 
     unsafe fn place_horizontal_drag_preview(&mut self, proposal: Bounds, work: RECT) {
-        let scale = fitted_toolbar_scale(ToolbarLayout::Horizontal, self.scale, work);
+        let geometry = self.toolbar_geometry(ToolbarLayout::Horizontal);
+        let scale = fitted_toolbar_scale(geometry, self.scale, work);
         let bounds = horizontal_drag_preview(proposal, work, self.scale);
         let clip = (bounds.right > work.right).then_some(Bounds::new(
             work.left,
@@ -838,8 +1002,10 @@ impl App {
         }
         self.toolbar_clipped = clip.is_some();
         if changed {
+            let geometry = self.toolbar_geometry(layout);
+            self.toolbar_tips.hide();
             self.toolbar_tips
-                .set_bounds(self.toolbar, layout, scale, TTM_NEWTOOLRECTW);
+                .set_bounds(self.toolbar, geometry, scale, TTM_NEWTOOLRECTW);
         }
         if changed || moved || clip.is_some() {
             self.paint_glass();
@@ -900,9 +1066,24 @@ impl App {
         self.toolbar_drag = DragGeometry::begin(
             DragPoint::new(pointer.x, pointer.y),
             Bounds::new(bounds.left, bounds.top, bounds.right, bounds.bottom),
-            self.toolbar_layout,
+            self.toolbar_geometry(self.toolbar_layout),
             self.toolbar_scale,
         );
+        if self.toolbar_layout == ToolbarLayout::Vertical {
+            let work = monitor_work_area(pointer);
+            let left_gap = i64::from(bounds.left) - i64::from(work.left);
+            let release = docking::RELEASE_DISTANCE_DIP * f64::from(self.scale);
+            if left_gap as f64 <= release
+                && let Some(geometry) = self.toolbar_drag.as_mut()
+            {
+                geometry.rebase_docked(
+                    DragPoint::new(pointer.x, pointer.y),
+                    Bounds::new(bounds.left, bounds.top, bounds.right, bounds.bottom),
+                    self.toolbar_scale,
+                    Edge::Left,
+                );
+            }
+        }
         if self.toolbar_drag.is_none() {
             return;
         }
@@ -940,10 +1121,26 @@ impl App {
         };
         // A slide can separate the real cursor from the column. Monitor
         // selection follows the logical handle carried by the drag instead.
-        let work = monitor_work_area(POINT {
+        let mut work = monitor_work_area(POINT {
             x: handle.x,
             y: handle.y,
         });
+        let horizontal = self.toolbar_geometry(ToolbarLayout::Horizontal);
+        let vertical = horizontal.with_layout(ToolbarLayout::Vertical);
+        // A right-edge slide may leave the real cursor far left of the virtual
+        // handle. At the physical outer edge, that remaining travel is
+        // unreachable. A shared monitor seam must keep the virtual reference.
+        let outer_left = outer_left_work_area(pointer).filter(|candidate| {
+            let scale = fitted_toolbar_scale(horizontal, self.scale, *candidate);
+            self.toolbar_drag
+                .and_then(|drag| {
+                    proposed_toolbar_bounds(ToolbarLayout::Horizontal, pointer, drag, scale)
+                })
+                .is_some_and(|proposal| proposal.left > candidate.left)
+        });
+        if let Some(outer_work) = outer_left {
+            work = outer_work;
+        }
         let work_bounds = Bounds::new(work.left, work.top, work.right, work.bottom);
         if self
             .toolbar_animation
@@ -958,8 +1155,7 @@ impl App {
             let Some(drag) = self.toolbar_drag else {
                 return;
             };
-            let horizontal_scale =
-                fitted_toolbar_scale(ToolbarLayout::Horizontal, self.scale, work);
+            let horizontal_scale = fitted_toolbar_scale(horizontal, self.scale, work);
             let Some(proposal) =
                 proposed_toolbar_bounds(ToolbarLayout::Horizontal, pointer, drag, horizontal_scale)
             else {
@@ -971,8 +1167,16 @@ impl App {
             } else {
                 self.toolbar_layout
             };
-            let desired = docking::choose_layout(current, proposal, work_bounds, self.scale);
-            if current == ToolbarLayout::Vertical && desired == ToolbarLayout::Vertical {
+            let push_left = outer_left.is_some() && proposal.left > work.left;
+            let desired = if push_left {
+                ToolbarLayout::Vertical
+            } else {
+                docking::choose_layout(current, proposal, work_bounds, self.scale)
+            };
+            if !push_left
+                && current == ToolbarLayout::Vertical
+                && desired == ToolbarLayout::Vertical
+            {
                 let pinned = self.toolbar_animation.as_ref().map(DockAnimation::edge);
                 if pinned
                     .is_some_and(|edge| docking::nearest_edge(proposal, work_bounds) != Some(edge))
@@ -990,13 +1194,27 @@ impl App {
                 } else {
                     self.toolbar_layout = ToolbarLayout::Horizontal;
                     self.place_toolbar(proposal.left, proposal.top, work);
+                    if let Some(geometry) = self.toolbar_drag.as_mut() {
+                        geometry.rebase(
+                            DragPoint::new(pointer.x, pointer.y),
+                            proposal,
+                            ToolbarLayout::Horizontal,
+                            horizontal_scale,
+                        );
+                    }
                 }
                 self.align_toolbar_drag(pointer, Some(proposal), work);
-            } else if current == ToolbarLayout::Horizontal {
-                let edge = docking::nearest_edge(proposal, work_bounds).unwrap_or(Edge::Left);
+            } else if current == ToolbarLayout::Horizontal || push_left {
+                let edge = if push_left {
+                    Edge::Left
+                } else {
+                    docking::nearest_edge(proposal, work_bounds).unwrap_or(Edge::Left)
+                };
                 // Continue from the visible overhang instead of snapping the
                 // toolbar back inside before its slide-out animation.
-                self.place_horizontal_drag_preview(proposal, work);
+                if !push_left {
+                    self.place_horizontal_drag_preview(proposal, work);
+                }
                 let dpi = GetDpiForWindow(self.toolbar);
                 let actual_scale = (dpi as f32 / 96.0).max(1.0);
                 if dpi != 0 && (self.scale - actual_scale).abs() >= 0.001 {
@@ -1005,25 +1223,27 @@ impl App {
                 }
                 let mut source = RECT::default();
                 GetWindowRect(self.toolbar, &mut source);
-                let Some(target) = docked_toolbar_bounds(edge, pointer, drag, self.scale, work)
+                let source_layout = self.toolbar_layout;
+                let Some(target) =
+                    docked_toolbar_bounds(edge, pointer, drag, vertical, self.scale, work)
                 else {
                     self.finish_toolbar_drag();
                     return;
                 };
-                let vertical_scale =
-                    fitted_toolbar_scale(ToolbarLayout::Vertical, self.scale, work);
+                let vertical_scale = fitted_toolbar_scale(vertical, self.scale, work);
                 if let Some(geometry) = self.toolbar_drag.as_mut() {
                     // The slide separates the pointer from the visible column.
                     // Keep pointer deltas attached to its final logical target.
-                    geometry.rebase(
+                    geometry.rebase_docked(
                         DragPoint::new(pointer.x, pointer.y),
                         target,
-                        ToolbarLayout::Vertical,
                         vertical_scale,
+                        edge,
                     );
                 }
                 self.toolbar_animation = Some(DockAnimation::new(
                     Bounds::new(source.left, source.top, source.right, source.bottom),
+                    source_layout,
                     target,
                     work_bounds,
                     edge,
@@ -1034,7 +1254,7 @@ impl App {
                 }
                 return;
             } else if self.toolbar_animation.is_some() {
-                let scale = fitted_toolbar_scale(ToolbarLayout::Vertical, self.scale, work);
+                let scale = fitted_toolbar_scale(vertical, self.scale, work);
                 let Some(proposed) =
                     proposed_toolbar_bounds(ToolbarLayout::Vertical, pointer, drag, scale)
                 else {
@@ -1063,7 +1283,7 @@ impl App {
                 return;
             } else {
                 self.toolbar_layout = ToolbarLayout::Vertical;
-                let scale = fitted_toolbar_scale(ToolbarLayout::Vertical, self.scale, work);
+                let scale = fitted_toolbar_scale(vertical, self.scale, work);
                 let Some(bounds) =
                     proposed_toolbar_bounds(ToolbarLayout::Vertical, pointer, drag, scale)
                 else {
@@ -1133,7 +1353,11 @@ impl App {
             && (queued_pointer.is_some() || GetCursorPos(&mut pointer) != 0);
         for _ in 0..2 {
             if has_pointer {
-                let scale = fitted_toolbar_scale(ToolbarLayout::Vertical, self.scale, work_rect);
+                let scale = fitted_toolbar_scale(
+                    self.toolbar_geometry(ToolbarLayout::Vertical),
+                    self.scale,
+                    work_rect,
+                );
                 if let Some(bounds) = self.toolbar_drag.and_then(|geometry| {
                     proposed_toolbar_bounds(ToolbarLayout::Vertical, pointer, geometry, scale)
                 }) {
@@ -1176,7 +1400,8 @@ impl App {
             right: work.right,
             bottom: work.bottom,
         };
-        let scale = fitted_toolbar_scale(frame.layout, self.scale, work_rect);
+        let scale =
+            fitted_toolbar_scale(self.toolbar_geometry(frame.layout), self.scale, work_rect);
         self.apply_toolbar_frame(frame.layout, scale, frame.bounds, Some(work));
     }
 
@@ -1245,6 +1470,19 @@ impl App {
         }
         if newly_shown {
             ShowWindow(self.overlay, SW_SHOWNOACTIVATE);
+            if let Some(ruler) = &self.ruler
+                && ruler.is_visible()
+            {
+                SetWindowPos(
+                    ruler.handle(),
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                );
+            }
             SetWindowPos(
                 self.toolbar,
                 HWND_TOPMOST,
@@ -1300,8 +1538,10 @@ impl App {
         self.stop_hold();
         self.commit_edit();
         self.cancel_capture();
-        self.panel_drag = None;
+        self.cancel_panel_drag();
         ShowWindow(self.panel, SW_HIDE);
+        self.panel_material = None;
+        ui::clear_color_gradients();
         self.ui_visible = visible;
         self.settings.toolbar_visible = visible;
         self.toolbar_pointer = None;
@@ -1313,6 +1553,9 @@ impl App {
         } else {
             KillTimer(self.toolbar, TIMER_GLASS);
             self.glass = Glass::default();
+            if let Some(ruler) = &mut self.ruler {
+                ruler.hide();
+            }
         }
         ShowWindow(
             self.toolbar,
@@ -1379,6 +1622,7 @@ impl App {
     }
 
     unsafe fn finish_gesture(&mut self) {
+        self.ruler_snap = None;
         if self.ink.is_drawing() {
             self.ink.end();
             self.last_point = None;
@@ -1474,9 +1718,7 @@ impl App {
         self.finish_gesture();
         self.stop_hold();
         self.commit_edit();
-        if self.panel_drag.take().is_some() {
-            ReleaseCapture();
-        }
+        self.cancel_panel_drag();
         let mut cursor = POINT::default();
         if GetCursorPos(&mut cursor) == 0 {
             return;
@@ -1760,7 +2002,22 @@ impl App {
         if !self.interactive || self.hold.is_some() || self.radial_hold.is_some() {
             return;
         }
-        let point = Point::new(x as f32, y as f32);
+        let screen = POINT {
+            x: x + self.origin.x,
+            y: y + self.origin.y,
+        };
+        self.ruler_snap = if self.tool == Tool::Pen {
+            self.ruler.as_ref().and_then(|ruler| ruler.snap(screen))
+        } else {
+            None
+        };
+        let point = self.ink_point(screen);
+        if self.tool == Tool::Fill {
+            if let Some(bounds) = self.ink.fill_at(point, self.primary()) {
+                self.render(Some(ink_dirty_rect(bounds)));
+            }
+            return;
+        }
         // Keep the pre-erase width for the entire gesture: the widest stroke
         // may disappear on the very first sample, but its old pixels still
         // need to be included in subsequent dirty rectangles.
@@ -1771,9 +2028,10 @@ impl App {
             .map(|stroke| stroke.width)
             .fold(0.0, f32::max);
         let width = match self.tool {
-            Tool::Pen => self.settings.pen_width,
+            Tool::Pen | Tool::Shape => self.settings.pen_width,
             Tool::Eraser => self.settings.eraser_diameter,
             Tool::ObjectEraser => 22.0,
+            Tool::Fill => return,
         } * self.scale;
         let old_count = self.ink.strokes().len();
         let object_area = if self.tool == Tool::ObjectEraser {
@@ -1781,12 +2039,21 @@ impl App {
         } else {
             None
         };
-        self.ink.begin(point, self.tool, self.primary(), width);
+        if self.tool == Tool::Shape {
+            self.ink
+                .begin_shape(point, self.shape_kind, self.primary(), width);
+        } else {
+            self.ink.begin(point, self.tool, self.primary(), width);
+        }
         self.last_point = Some(point);
         SetCapture(self.overlay);
         if self.tool == Tool::ObjectEraser {
             if old_count != self.ink.strokes().len() {
                 self.render(object_area);
+            }
+        } else if self.tool == Tool::Shape {
+            if let Some(stroke) = self.ink.active_stroke() {
+                self.render(Some(ink_dirty_rect(stroke.bounds())));
             }
         } else {
             self.render_pointer(point, point);
@@ -1800,7 +2067,29 @@ impl App {
         if !self.ink.is_drawing() {
             return;
         }
-        let point = Point::new(x as f32, y as f32);
+        let point = self.ink_point(POINT {
+            x: x + self.origin.x,
+            y: y + self.origin.y,
+        });
+        if self.tool == Tool::Shape {
+            let before = self
+                .ink
+                .active_stroke()
+                .map(|stroke| ink_dirty_rect(stroke.bounds()));
+            self.ink.extend(point);
+            self.last_point = Some(point);
+            let after = self
+                .ink
+                .active_stroke()
+                .map(|stroke| ink_dirty_rect(stroke.bounds()));
+            if let Some(dirty) = before
+                .map(|old| after.map_or(old, |new| old.union(new)))
+                .or(after)
+            {
+                self.render(Some(dirty));
+            }
+            return;
+        }
         let old_count = self.ink.strokes().len();
         let object_area = if self.tool == Tool::ObjectEraser {
             object_dirty_area(&self.ink, last, point, 11.0 * self.scale)
@@ -1816,6 +2105,17 @@ impl App {
         } else {
             self.render_pointer(last, point);
         }
+    }
+
+    fn ink_point(&self, screen: POINT) -> Point {
+        let projected = self
+            .ruler_snap
+            .as_ref()
+            .map_or(screen, |snap| snap.project(screen));
+        Point::new(
+            (projected.x - self.origin.x) as f32,
+            (projected.y - self.origin.y) as f32,
+        )
     }
 
     unsafe fn render_pointer(&mut self, previous: Point, point: Point) {
@@ -1840,6 +2140,7 @@ impl App {
     }
 
     unsafe fn open_panel(&mut self, tab: usize) {
+        self.toolbar_tips.hide();
         self.finish_toolbar_animation();
         self.finish_toolbar_drag();
         self.close_radial();
@@ -1853,6 +2154,12 @@ impl App {
         self.hsv = ui::rgb_to_hsv(self.edited_color());
         self.sync_edits(None);
         self.show_edits();
+        self.place_panel();
+        SetForegroundWindow(self.panel);
+        self.redraw_ui();
+    }
+
+    unsafe fn place_panel(&mut self) {
         let mut toolbar_rect = RECT::default();
         GetWindowRect(self.toolbar, &mut toolbar_rect);
         let monitor = MonitorFromWindow(self.toolbar, MONITOR_DEFAULTTONEAREST);
@@ -1895,6 +2202,21 @@ impl App {
             info.rcWork.top,
             (info.rcWork.bottom - height).max(info.rcWork.top),
         );
+        let mut previous = RECT::default();
+        GetWindowRect(self.panel, &mut previous);
+        let bounds = RECT {
+            left: x,
+            top: y,
+            right: x + width,
+            bottom: y + height,
+        };
+        if self.panel_material.is_none()
+            || (previous.left, previous.top, previous.right, previous.bottom)
+                != (bounds.left, bounds.top, bounds.right, bounds.bottom)
+        {
+            ShowWindow(self.panel, SW_HIDE);
+            self.panel_material = Some(PanelMaterial::capture(bounds, self.settings.toolbar_theme));
+        }
         SetWindowPos(
             self.panel,
             HWND_TOPMOST,
@@ -1904,16 +2226,70 @@ impl App {
             height,
             SWP_SHOWWINDOW,
         );
-        SetForegroundWindow(self.panel);
-        self.redraw_ui();
     }
 
     unsafe fn close_panel(&mut self) {
         self.commit_edit();
         self.cancel_capture();
-        self.panel_drag = None;
+        self.cancel_panel_drag();
         ShowWindow(self.panel, SW_HIDE);
+        self.panel_material = None;
+        ui::clear_color_gradients();
         self.save();
+    }
+
+    unsafe fn cancel_panel_drag(&mut self) {
+        self.panel_drag = None;
+        self.toolbar_edit_drag = None;
+        if GetCapture() == self.panel {
+            ReleaseCapture();
+        }
+    }
+
+    unsafe fn refresh_panel_material(&mut self) {
+        let mut bounds = RECT::default();
+        if IsWindowVisible(self.panel) != 0 && GetWindowRect(self.panel, &mut bounds) != 0 {
+            ShowWindow(self.panel, SW_HIDE);
+            self.panel_material = Some(PanelMaterial::capture(bounds, self.settings.toolbar_theme));
+            ShowWindow(self.panel, SW_SHOW);
+        }
+    }
+
+    unsafe fn toolbar_editor_click(&mut self, x: i32, y: i32) {
+        match toolbar_editor::click(x, y, &self.settings.toolbar_buttons) {
+            Some(ToolbarCommand::Theme(theme)) if theme != self.settings.toolbar_theme => {
+                self.settings.toolbar_theme = theme;
+                if let Some(ruler) = &mut self.ruler
+                    && let Err(error) = ruler.set_theme(theme)
+                {
+                    self.status = error;
+                }
+                self.refresh_panel_material();
+                self.save_later();
+                self.redraw_ui();
+            }
+            Some(ToolbarCommand::Labels) => {
+                self.settings.toolbar_labels = !self.settings.toolbar_labels;
+                self.toolbar_reconfigured();
+            }
+            Some(ToolbarCommand::Reset) => {
+                if toolbar_preferences::reset_buttons(&mut self.settings.toolbar_buttons) {
+                    self.toolbar_reconfigured();
+                }
+            }
+            Some(ToolbarCommand::Drag(button)) => {
+                SetCapture(self.panel);
+                if GetCapture() == self.panel {
+                    self.toolbar_edit_drag = Some(toolbar_editor::Drag {
+                        button,
+                        start: (x, y),
+                        point: (x, y),
+                    });
+                    self.redraw_ui();
+                }
+            }
+            _ => {}
+        }
     }
 
     fn px(&self, value: i32) -> i32 {
@@ -2122,29 +2498,38 @@ impl App {
     }
 
     unsafe fn toolbar_click(&mut self, x: i32, y: i32, client_point: POINT) {
-        if let Some(index) = self.toolbar_layout.hit_test(x, y) {
-            match index {
-                0 => self.select_tool(Tool::Pen, false),
-                1 => self.action(Action::TogglePen, false),
-                2 => self.action(Action::Eraser, false),
-                3 => self.action(Action::ObjectEraser, false),
-                4 => self.action(Action::Undo, false),
-                5 => self.action(Action::Clear, false),
-                6 => self.open_panel(0),
-                7 => {
+        let geometry = self.toolbar_geometry(self.toolbar_layout);
+        if let Some(button) = geometry
+            .hit_test(x, y)
+            .and_then(|index| geometry.button(index))
+        {
+            match button {
+                ToolbarButton::Cursor => self.select_tool(Tool::Pen, false),
+                ToolbarButton::Pen => self.action(Action::TogglePen, false),
+                ToolbarButton::Eraser => self.action(Action::Eraser, false),
+                ToolbarButton::ObjectEraser => self.action(Action::ObjectEraser, false),
+                ToolbarButton::Undo => self.action(Action::Undo, false),
+                ToolbarButton::Clear => self.action(Action::Clear, false),
+                ToolbarButton::Color => self.open_panel(0),
+                ToolbarButton::Settings => {
                     if IsWindowVisible(self.panel) != 0 {
                         self.close_panel();
                     } else {
                         self.open_panel(1);
                     }
                 }
-                8 => self.action(Action::ToggleUi, false),
-                9 => self.action(Action::Quit, false),
-                _ => {}
+                ToolbarButton::Hide => self.action(Action::ToggleUi, false),
+                ToolbarButton::Quit => self.action(Action::Quit, false),
+                ToolbarButton::Shapes => {
+                    self.toolbar_tips.hide();
+                    PostMessageW(self.toolbar, SHAPE_REQUEST, 0, 0);
+                }
+                ToolbarButton::Ruler => self.toggle_ruler(),
+                ToolbarButton::Fill => self.select_tool(Tool::Fill, true),
             }
             return;
         }
-        if self.toolbar_layout.is_drag_handle(x, y) {
+        if geometry.is_drag_handle(x, y) {
             self.begin_toolbar_drag(client_point);
         }
     }
@@ -2157,8 +2542,8 @@ impl App {
             return;
         }
         if (76..108).contains(&y) {
-            for (tab, left) in [24, 164, 304].into_iter().enumerate() {
-                if (left..left + 130).contains(&x) {
+            for (tab, left) in ui::TAB_LEFT.into_iter().enumerate() {
+                if (left..left + ui::TAB_WIDTH).contains(&x) {
                     self.cancel_capture();
                     self.tab = tab;
                     self.show_edits();
@@ -2231,6 +2616,7 @@ impl App {
                     }
                 }
             }
+            3 => self.toolbar_editor_click(x, y),
             _ => {}
         }
         if self.panel_drag.is_some() {
@@ -2240,6 +2626,11 @@ impl App {
     }
 
     unsafe fn panel_move(&mut self, x: i32, y: i32) {
+        if let Some(drag) = &mut self.toolbar_edit_drag {
+            drag.point = (x, y);
+            self.redraw_ui();
+            return;
+        }
         let Some(drag) = self.panel_drag else {
             return;
         };
@@ -2487,6 +2878,50 @@ impl Drop for App {
     }
 }
 
+unsafe fn request_shape(toolbar: HWND) {
+    let request = APP.with(|cell| {
+        let mut state = cell.try_borrow_mut().ok()?;
+        let app = state.as_mut()?;
+        if toolbar != app.toolbar || !app.ui_visible || app.radial_hold.is_some() || app.removing {
+            return None;
+        }
+        let index = app
+            .settings
+            .toolbar_buttons
+            .iter()
+            .position(|&button| button == ToolbarButton::Shapes)?;
+        let geometry = app.toolbar_geometry(app.toolbar_layout);
+        let (x, y, width, height) = geometry.button_bounds(index)?;
+        let mut window = RECT::default();
+        if GetWindowRect(toolbar, &mut window) == 0 {
+            return None;
+        }
+        let px = |value| (value as f32 * app.toolbar_scale).round() as i32;
+        let bounds = RECT {
+            left: window.left + px(x),
+            top: window.top + px(y),
+            right: window.left + px(x + width),
+            bottom: window.top + px(y + height),
+        };
+        Some((
+            bounds,
+            app.toolbar_layout == ToolbarLayout::Vertical,
+            app.shape_kind,
+        ))
+    });
+    let Some((bounds, vertical, selected)) = request else {
+        return;
+    };
+    if let Some(shape) = crate::shape_picker::pick(toolbar, bounds, vertical, selected) {
+        APP.with(|cell| {
+            if let Some(app) = cell.borrow_mut().as_mut() {
+                app.shape_kind = shape;
+                app.select_tool(Tool::Shape, true);
+            }
+        });
+    }
+}
+
 /// Keep native prompts and shell calls outside the application borrow.
 unsafe fn request_update(panel: HWND) {
     let request = APP.with(|cell| {
@@ -2656,6 +3091,10 @@ unsafe extern "system" fn window_proc(
         request_update(hwnd);
         return 0;
     }
+    if message == SHAPE_REQUEST {
+        request_shape(hwnd);
+        return 0;
+    }
     // Popup menus also run a nested message loop; never retain the application
     // borrow while a tray menu is open or shortcut messages would be skipped.
     if message == tray::CALLBACK_MESSAGE {
@@ -2762,7 +3201,12 @@ unsafe extern "system" fn window_proc(
                     if !memory.is_null() && !bitmap.is_null() {
                         let old = SelectObject(memory, bitmap);
                         let state = app.ui_state();
-                        ui::paint_panel(memory, app.panel_scale, &state);
+                        ui::paint_panel(
+                            memory,
+                            app.panel_scale,
+                            &state,
+                            app.panel_material.as_ref(),
+                        );
                         BitBlt(dc, 0, 0, bounds.right, bounds.bottom, memory, 0, 0, SRCCOPY);
                         SelectObject(memory, old);
                     }
@@ -2822,7 +3266,9 @@ unsafe extern "system" fn window_proc(
                         return 0;
                     }
                     app.toolbar_pointer = Some(POINT { x, y });
-                    let hover = app.toolbar_layout.hit_test(logical_x, logical_y);
+                    let hover = app
+                        .toolbar_geometry(app.toolbar_layout)
+                        .hit_test(logical_x, logical_y);
                     if app.hover != hover {
                         app.hover = hover;
                         app.redraw_ui();
@@ -2838,6 +3284,7 @@ unsafe extern "system" fn window_proc(
                 0
             }
             WM_MOUSELEAVE if hwnd == app.toolbar => {
+                app.toolbar_tips.hide();
                 app.hover = None;
                 app.toolbar_pointer = None;
                 app.redraw_ui();
@@ -2853,6 +3300,20 @@ unsafe extern "system" fn window_proc(
                     app.finish_gesture();
                 }
                 if hwnd == app.panel {
+                    if let Some(drag) = app.toolbar_edit_drag.take() {
+                        ReleaseCapture();
+                        if toolbar_editor::drop_button(
+                            &mut app.settings.toolbar_buttons,
+                            drag,
+                            logical_x,
+                            logical_y,
+                        ) {
+                            app.toolbar_reconfigured();
+                        } else {
+                            app.redraw_ui();
+                        }
+                        return 0;
+                    }
                     if app.panel_drag.take().is_some() {
                         ReleaseCapture();
                     }
@@ -2867,14 +3328,28 @@ unsafe extern "system" fn window_proc(
                 if hwnd == app.overlay && app.ink.is_drawing() {
                     app.ink.end();
                     app.last_point = None;
+                    app.ruler_snap = None;
                 }
                 if hwnd == app.panel {
                     app.panel_drag = None;
+                    if app.toolbar_edit_drag.take().is_some() {
+                        app.redraw_ui();
+                    }
                 }
                 0
             }
             WM_CANCELMODE if hwnd == app.toolbar => {
                 app.finish_toolbar_drag();
+                0
+            }
+            WM_CANCELMODE if hwnd == app.panel => {
+                app.cancel_panel_drag();
+                app.redraw_ui();
+                0
+            }
+            WM_EXITSIZEMOVE if hwnd == app.panel => {
+                app.refresh_panel_material();
+                app.redraw_ui();
                 0
             }
             WM_HOTKEY if hwnd == app.toolbar => {
@@ -3059,7 +3534,7 @@ unsafe extern "system" fn window_proc(
     if handled
         && matches!(
             message,
-            WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_TIMER | WM_DPICHANGED
+            WM_MOUSEMOVE | WM_MOUSELEAVE | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_TIMER | WM_DPICHANGED
         )
     {
         UpdateWindow(hwnd);
@@ -3076,16 +3551,32 @@ fn proposed_toolbar_bounds(
     drag.proposed_bounds(DragPoint::new(pointer.x, pointer.y), layout, scale)
 }
 
+fn ink_dirty_rect(bounds: crate::ink::Bounds) -> Rect {
+    Rect::new(
+        (bounds.min_x - 2.0).floor() as i32,
+        (bounds.min_y - 2.0).floor() as i32,
+        (bounds.max_x + 2.0).ceil() as i32 + 1,
+        (bounds.max_y + 2.0).ceil() as i32 + 1,
+    )
+}
+
 fn docked_toolbar_bounds(
     edge: Edge,
     pointer: POINT,
     drag: DragGeometry,
+    geometry: ToolbarGeometry,
     dpi_scale: f32,
     work: RECT,
 ) -> Option<Bounds> {
-    let scale = fitted_toolbar_scale(ToolbarLayout::Vertical, dpi_scale, work);
+    let scale = fitted_toolbar_scale(geometry, dpi_scale, work);
     let proposed = proposed_toolbar_bounds(ToolbarLayout::Vertical, pointer, drag, scale)?;
-    Some(vertical_edge_bounds(edge, proposed.top, dpi_scale, work))
+    Some(vertical_edge_bounds(
+        edge,
+        proposed.top,
+        geometry,
+        dpi_scale,
+        work,
+    ))
 }
 
 fn clamped_toolbar_bounds(bounds: Bounds, work: RECT) -> Bounds {
@@ -3170,9 +3661,38 @@ unsafe fn has_neighbor_monitor(work: RECT, handle: DragPoint, dx: i32, dy: i32) 
     !neighbor.is_null() && neighbor != current
 }
 
-fn vertical_edge_bounds(edge: Edge, top: i32, dpi_scale: f32, work: RECT) -> Bounds {
-    let scale = fitted_toolbar_scale(ToolbarLayout::Vertical, dpi_scale, work);
-    let (width, height) = ToolbarLayout::Vertical.size();
+unsafe fn outer_left_work_area(pointer: POINT) -> Option<RECT> {
+    let monitor = MonitorFromPoint(pointer, MONITOR_DEFAULTTONULL);
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if monitor.is_null()
+        || GetMonitorInfoW(monitor, &mut info) == 0
+        || pointer.x != info.rcMonitor.left
+    {
+        return None;
+    }
+    let neighbor = info
+        .rcMonitor
+        .left
+        .checked_sub(1)
+        .map(|x| MonitorFromPoint(POINT { x, y: pointer.y }, MONITOR_DEFAULTTONULL));
+    if neighbor.is_some_and(|neighbor| !neighbor.is_null()) {
+        return None;
+    }
+    Some(info.rcWork)
+}
+
+fn vertical_edge_bounds(
+    edge: Edge,
+    top: i32,
+    geometry: ToolbarGeometry,
+    dpi_scale: f32,
+    work: RECT,
+) -> Bounds {
+    let scale = fitted_toolbar_scale(geometry, dpi_scale, work);
+    let (width, height) = geometry.size();
     let (width, height) = (
         (width as f32 * scale).round() as i32,
         (height as f32 * scale).round() as i32,
@@ -3220,7 +3740,7 @@ unsafe fn monitor_work_area(point: POINT) -> RECT {
     }
 }
 
-fn fitted_toolbar_scale(layout: ToolbarLayout, dpi_scale: f32, work: RECT) -> f32 {
+fn fitted_toolbar_scale(layout: ToolbarGeometry, dpi_scale: f32, work: RECT) -> f32 {
     fitted_surface_scale(layout.size(), dpi_scale, work)
 }
 
@@ -3393,6 +3913,101 @@ pub fn show_error(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::UI::Controls::{TTM_GETDELAYTIME, TTM_GETTOOLCOUNT, TTM_GETTOOLINFOW};
+
+    #[test]
+    fn native_toolbar_tips_keep_their_labels_delay_and_rotated_bounds() {
+        unsafe {
+            let instance = GetModuleHandleW(ptr::null());
+            let toolbar = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                wide("Static").as_ptr(),
+                ptr::null(),
+                WS_POPUP,
+                0,
+                0,
+                480,
+                60,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                instance,
+                ptr::null(),
+            );
+            assert!(!toolbar.is_null());
+            let mut tips = ToolbarTips::new(
+                toolbar,
+                instance,
+                ToolbarGeometry::default_for(ToolbarLayout::Horizontal),
+                1.0,
+            );
+            assert!(!tips.window.is_null());
+            assert_eq!(
+                SendMessageW(tips.window, TTM_GETTOOLCOUNT, 0, 0),
+                ToolbarButton::DEFAULT.len() as isize
+            );
+            for delay in [TTDT_INITIAL, TTDT_RESHOW] {
+                assert_eq!(
+                    SendMessageW(tips.window, TTM_GETDELAYTIME, delay as usize, 0),
+                    450
+                );
+            }
+            for (layout, scale) in [
+                (ToolbarLayout::Horizontal, 1.0),
+                (ToolbarLayout::Vertical, 1.5),
+            ] {
+                let geometry = ToolbarGeometry::default_for(layout);
+                tips.set_bounds(toolbar, geometry, scale, TTM_NEWTOOLRECTW);
+                for (button, label) in [
+                    (ToolbarButton::Hide as usize, "Hide toolbar"),
+                    (ToolbarButton::Quit as usize, "Quit Study Pen"),
+                ] {
+                    let mut text = [0u16; 80];
+                    let mut tool = TTTOOLINFOW {
+                        cbSize: ToolbarTips::TOOL_INFO_SIZE,
+                        hwnd: toolbar,
+                        uId: button + 1,
+                        lpszText: text.as_mut_ptr(),
+                        ..Default::default()
+                    };
+                    assert_ne!(
+                        SendMessageW(
+                            tips.window,
+                            TTM_GETTOOLINFOW,
+                            0,
+                            &mut tool as *mut TTTOOLINFOW as isize,
+                        ),
+                        0
+                    );
+                    assert!(text.starts_with(&wide(label)));
+                    let (x, y, w, h) = geometry.button_bounds(button).unwrap();
+                    assert_eq!(
+                        [
+                            tool.rect.left,
+                            tool.rect.top,
+                            tool.rect.right,
+                            tool.rect.bottom
+                        ],
+                        [x, y, x + w, y + h].map(|value| (value as f32 * scale).round() as i32)
+                    );
+                }
+            }
+            let custom = [ToolbarButton::Quit, ToolbarButton::Settings];
+            tips.rebuild(
+                toolbar,
+                ToolbarGeometry::new(ToolbarLayout::Horizontal, &custom, true),
+                1.0,
+            );
+            assert_eq!(SendMessageW(tips.window, TTM_GETTOOLCOUNT, 0, 0), 0);
+            tips.rebuild(
+                toolbar,
+                ToolbarGeometry::new(ToolbarLayout::Horizontal, &custom, false),
+                1.0,
+            );
+            assert_eq!(SendMessageW(tips.window, TTM_GETTOOLCOUNT, 0, 0), 2);
+            drop(tips);
+            DestroyWindow(toolbar);
+        }
+    }
 
     #[test]
     fn right_drag_preview_visibly_overhangs_before_docking_and_caps_fast_drags() {
@@ -3464,13 +4079,18 @@ mod tests {
             bottom: 900,
         };
         let dpi_scale = 2.0;
-        let scale = fitted_toolbar_scale(ToolbarLayout::Vertical, dpi_scale, work);
+        let vertical = ToolbarGeometry::default_for(ToolbarLayout::Vertical);
+        let scale = fitted_toolbar_scale(vertical, dpi_scale, work);
         assert!(scale < dpi_scale);
-        let (width, height) = ToolbarLayout::Vertical.size();
+        let (width, height) = vertical.size();
         assert!((height as f32 * scale).round() as i32 <= work.bottom);
         assert!((width as f32 * scale).round() as i32 <= work.right);
         assert_eq!(
-            fitted_toolbar_scale(ToolbarLayout::Horizontal, dpi_scale, work),
+            fitted_toolbar_scale(
+                vertical.with_layout(ToolbarLayout::Horizontal),
+                dpi_scale,
+                work
+            ),
             dpi_scale
         );
     }

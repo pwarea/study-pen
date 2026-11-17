@@ -1,4 +1,4 @@
-//! Two-stage, horizontal-to-vertical toolbar docking in physical pixels.
+//! Two-stage toolbar docking in physical pixels.
 //!
 //! Layout changes only while the toolbar is fully outside the work area. The
 //! host clips every presented frame to that area and owns drag cancellation.
@@ -22,6 +22,7 @@ pub struct MotionFrame {
 #[derive(Clone, Debug)]
 pub struct DockAnimation {
     source: Bounds,
+    source_layout: ToolbarLayout,
     target: Bounds,
     work: Bounds,
     edge: Edge,
@@ -29,9 +30,17 @@ pub struct DockAnimation {
 }
 
 impl DockAnimation {
-    pub fn new(source: Bounds, target: Bounds, work: Bounds, edge: Edge, started: Instant) -> Self {
+    pub fn new(
+        source: Bounds,
+        source_layout: ToolbarLayout,
+        target: Bounds,
+        work: Bounds,
+        edge: Edge,
+        started: Instant,
+    ) -> Self {
         Self {
             source,
+            source_layout,
             target,
             work,
             edge,
@@ -61,7 +70,7 @@ impl DockAnimation {
         let elapsed = now.saturating_duration_since(self.started);
         if elapsed < OUT_DURATION {
             MotionFrame {
-                layout: ToolbarLayout::Horizontal,
+                layout: self.source_layout,
                 bounds: interpolate_x(
                     self.source,
                     i64::from(self.source.left),
@@ -128,7 +137,7 @@ mod tests {
     fn right_overhang_continues_into_the_slide_without_snapping_back_inside() {
         let started = Instant::now();
         let source = Bounds::new(1472, 300, 1952, 360);
-        let animation = DockAnimation::new(source, TARGET, WORK, Edge::Right, started);
+        let animation = DockAnimation::new(source, Horizontal, TARGET, WORK, Edge::Right, started);
         assert_eq!(animation.frame(started).bounds, source);
         let next = animation.frame(at(started, 12));
         assert_eq!(next.layout, Horizontal);
@@ -138,9 +147,25 @@ mod tests {
     }
 
     #[test]
+    fn bounded_pointer_recovery_slides_a_displaced_column_without_rotating_it() {
+        let started = Instant::now();
+        let source = Bounds::new(502, 100, 562, 580);
+        let target = Bounds::new(0, 100, 60, 580);
+        let animation = DockAnimation::new(source, Vertical, target, WORK, Edge::Left, started);
+        assert_eq!(animation.frame(started).bounds, source);
+        assert_eq!(animation.frame(started).layout, Vertical);
+        let moving = animation.frame(at(started, 12));
+        assert_eq!(moving.layout, Vertical);
+        assert!(moving.bounds.left < source.left);
+        assert_eq!(moving.bounds.right - moving.bounds.left, 60);
+        assert_eq!(animation.frame(at(started, 48)).layout, Vertical);
+        assert_eq!(animation.frame(at(started, 96)).bounds, target);
+    }
+
+    #[test]
     fn right_docking_changes_layout_fully_outside_and_finishes_at_the_exact_target() {
         let started = Instant::now();
-        let animation = DockAnimation::new(SOURCE, TARGET, WORK, Edge::Right, started);
+        let animation = DockAnimation::new(SOURCE, Horizontal, TARGET, WORK, Edge::Right, started);
         assert_eq!(
             animation.frame(started),
             MotionFrame {
@@ -175,7 +200,7 @@ mod tests {
     #[test]
     fn cubic_ease_out_moves_only_x_and_preserves_each_stages_shape() {
         let started = Instant::now();
-        let animation = DockAnimation::new(SOURCE, TARGET, WORK, Edge::Right, started);
+        let animation = DockAnimation::new(SOURCE, Horizontal, TARGET, WORK, Edge::Right, started);
         let outgoing = animation.frame(at(started, 24));
         assert_eq!(outgoing.layout, Horizontal);
         assert_eq!(outgoing.bounds, Bounds::new(1855, 300, 2335, 360));
@@ -191,7 +216,7 @@ mod tests {
         let work = Bounds::new(-2560, -120, 0, 1320);
         let source = Bounds::new(-2540, 250, -2060, 310);
         let target = Bounds::new(-2560, -80, -2500, 400);
-        let animation = DockAnimation::new(source, target, work, Edge::Left, started);
+        let animation = DockAnimation::new(source, Horizontal, target, work, Edge::Left, started);
         let mut previous = source.left;
         for milliseconds in 0..48 {
             let frame = animation.frame(at(started, milliseconds));
@@ -222,7 +247,8 @@ mod tests {
     #[test]
     fn retargeting_preserves_the_outgoing_path_and_original_completion_time() {
         let started = Instant::now();
-        let mut animation = DockAnimation::new(SOURCE, TARGET, WORK, Edge::Right, started);
+        let mut animation =
+            DockAnimation::new(SOURCE, Horizontal, TARGET, WORK, Edge::Right, started);
         let original_outgoing = animation.frame(at(started, 24));
         let updated = Bounds::new(1860, 400, 1920, 880);
         animation.retarget(updated);
@@ -255,7 +281,7 @@ mod tests {
     fn time_before_start_keeps_the_exact_source_frame() {
         let now = Instant::now();
         let started = now + Duration::from_millis(10);
-        let animation = DockAnimation::new(SOURCE, TARGET, WORK, Edge::Right, started);
+        let animation = DockAnimation::new(SOURCE, Horizontal, TARGET, WORK, Edge::Right, started);
         assert_eq!(animation.frame(now), animation.frame(started));
     }
 }

@@ -2,7 +2,8 @@
 
 use crate::{
     ink::Color,
-    ui::{self, ToolbarControls, ToolbarLayout},
+    toolbar_preferences::{ToolbarButton, ToolbarTheme},
+    ui::{self, ToolbarControls, ToolbarGeometry},
 };
 use std::{mem::size_of, ptr, slice};
 use windows_sys::Win32::{
@@ -13,6 +14,8 @@ use windows_sys::Win32::{
 
 const DARK_TINT_ALPHA: f32 = 0.56;
 const LIGHT_TINT_ALPHA: f32 = 0.54;
+const AIR_DARK_TINT_ALPHA: f32 = 0.76;
+const AIR_LIGHT_TINT_ALPHA: f32 = 0.66;
 
 struct Surface {
     dc: HDC,
@@ -114,19 +117,21 @@ struct Optic {
 
 #[derive(Clone, Copy, PartialEq)]
 struct GlyphKey {
-    layout: ToolbarLayout,
+    geometry: ToolbarGeometry,
     scale: f32,
     primary: Color,
     dark: bool,
+    theme: ToolbarTheme,
 }
 
 impl GlyphKey {
     fn new(scale: f32, controls: &ToolbarControls) -> Self {
         Self {
-            layout: controls.layout,
+            geometry: controls.geometry,
             scale,
             primary: controls.primary,
             dark: controls.dark,
+            theme: controls.theme,
         }
     }
 }
@@ -287,13 +292,46 @@ impl Buffers {
         let width = self.width;
         let height = self.height;
         let scale = frame.scale;
+        let air = frame.controls.theme == ToolbarTheme::LiquidAir;
         let active = frame.controls.selected();
-        let selected = frame.controls.layout.button_bounds(active);
+        let selected = active.and_then(|index| frame.controls.geometry.button_bounds(index));
+        let ruler_index = frame
+            .controls
+            .ruler_visible
+            .then(|| {
+                (0..frame.controls.geometry.len())
+                    .find(|&index| frame.controls.button(index) == Some(ToolbarButton::Ruler))
+            })
+            .flatten();
+        let ruler = ruler_index.and_then(|index| frame.controls.geometry.button_bounds(index));
         let hover = frame
             .controls
             .hover
-            .filter(|&index| index != active)
-            .and_then(|index| frame.controls.layout.button_bounds(index));
+            .filter(|index| Some(*index) != active && Some(*index) != ruler_index);
+        let hover_bounds = hover.and_then(|index| frame.controls.geometry.button_bounds(index));
+        let hovered_button = hover.and_then(|index| frame.controls.button(index));
+        let (hover_color, hover_strength) = match (hovered_button, dark) {
+            (Some(ToolbarButton::Hide), true) => (Color::rgb(74, 145, 255), 0.29),
+            (Some(ToolbarButton::Hide), false) => (Color::rgb(38, 113, 235), 0.20),
+            (Some(ToolbarButton::Quit), true) => (Color::rgb(247, 76, 92), 0.29),
+            (Some(ToolbarButton::Quit), false) => (Color::rgb(219, 46, 67), 0.20),
+            (_, true) => (Color::rgb(255, 255, 255), 0.09),
+            (_, false) => (Color::rgb(21, 21, 21), 0.09),
+        };
+        let hover_channels = [hover_color.b, hover_color.g, hover_color.r].map(f32::from);
+        let tint_alpha = if !sampled {
+            0.88
+        } else if air {
+            if dark {
+                AIR_DARK_TINT_ALPHA
+            } else {
+                AIR_LIGHT_TINT_ALPHA
+            }
+        } else if dark {
+            DARK_TINT_ALPHA
+        } else {
+            LIGHT_TINT_ALPHA
+        };
         let key = GlyphKey::new(scale, &frame.controls);
         if self.glyph_key != Some(key) {
             let Some(glyphs) =
@@ -338,16 +376,10 @@ impl Buffers {
                 let dy = (y - point.y) as f32 / (56.0 * scale);
                 0.095 / (1.0 + 4.0 * (dx * dx + dy * dy))
             });
-            let selected = chip_coverage(selected, x, y, scale);
-            let hovered = chip_coverage(hover, x, y, scale);
+            let selected =
+                chip_coverage(selected, x, y, scale).max(chip_coverage(ruler, x, y, scale));
+            let hovered = chip_coverage(hover_bounds, x, y, scale);
             let glint = (optic.rim + reflection * (0.4 + optic.rim)).min(0.86);
-            let tint_alpha = if !sampled {
-                0.88
-            } else if dark {
-                DARK_TINT_ALPHA
-            } else {
-                LIGHT_TINT_ALPHA
-            };
             let opacity = (1.0
                 - (1.0 - tint_alpha)
                     * (1.0 - lens)
@@ -356,17 +388,19 @@ impl Buffers {
                     * (1.0 - 0.10 * hovered))
                 * f32::from(alpha);
             let mut pixel = (opacity.round() as u32) << 24;
+            let neutral = if air {
+                air_tint(air_progress(x, y, width, height), dark)
+            } else if dark {
+                [34.0, 29.0, 26.0]
+            } else {
+                [251.0, 248.0, 245.0]
+            };
             for channel in 0..3 {
                 let shift = channel * 8;
-                let neutral = if dark {
-                    [34.0, 29.0, 26.0]
-                } else {
-                    [251.0, 248.0, 245.0]
-                };
                 let tinted = mix(neutral[channel], sample.channels[channel], lens);
                 let shaded = tinted * (1.0 - optic.shade * if dark { 0.31 } else { 0.17 });
                 let glass = mix(shaded, 255.0, glint);
-                let with_hover = mix(glass, if dark { 255.0 } else { 21.0 }, hovered * 0.09);
+                let with_hover = mix(glass, hover_channels[channel], hovered * hover_strength);
                 let value = mix(with_hover, 255.0, selected * if dark { 0.23 } else { 0.46 });
                 pixel |= ((value * opacity / 255.0).round() as u32) << shift;
             }
@@ -446,6 +480,41 @@ impl Glass {
 
 fn mix(a: f32, b: f32, amount: f32) -> f32 {
     a + (b - a) * amount
+}
+
+fn air_tint(progress: f32, dark: bool) -> [f32; 3] {
+    // Azure and periwinkle carry the material's color even over a neutral
+    // desktop. The darker palette preserves contrast for the light glyphs.
+    let (start, middle, end) = if dark {
+        (
+            [184.0, 112.0, 34.0],
+            [188.0, 95.0, 58.0],
+            [123.0, 54.0, 58.0],
+        )
+    } else {
+        (
+            [255.0, 247.0, 221.0],
+            [255.0, 219.0, 165.0],
+            [243.0, 185.0, 171.0],
+        )
+    };
+    let (from, to, blend) = if progress <= 0.55 {
+        (start, middle, progress / 0.55)
+    } else {
+        (middle, end, (progress - 0.55) / 0.45)
+    };
+    std::array::from_fn(|channel| mix(from[channel], to[channel], blend))
+}
+
+fn air_progress(x: i32, y: i32, width: i32, height: i32) -> f32 {
+    let horizontal = x as f32 / (width - 1).max(1) as f32;
+    let vertical = y as f32 / (height - 1).max(1) as f32;
+    let (length, thickness) = if width >= height {
+        (horizontal, vertical)
+    } else {
+        (vertical, horizontal)
+    };
+    0.78 * length + 0.22 * thickness
 }
 
 fn gaussian(value: f32) -> f32 {
@@ -603,17 +672,27 @@ fn chip_coverage(bounds: Option<(i32, i32, i32, i32)>, x: i32, y: i32, scale: f3
     };
     let dx = x as f32 + 0.5 - (left as f32 + width as f32 * 0.5) * scale;
     let dy = y as f32 + 0.5 - (top as f32 + height as f32 * 0.5) * scale;
-    let radius = width.min(height) as f32 * scale * 0.5;
-    if dx.abs() > radius + 0.5 || dy.abs() > radius + 0.5 {
+    let half_width = width as f32 * scale * 0.5;
+    let half_height = height as f32 * scale * 0.5;
+    if dx.abs() > half_width + 0.5 || dy.abs() > half_height + 0.5 {
         return 0.0;
     }
-    (radius + 0.5 - dx.hypot(dy)).clamp(0.0, 1.0)
+    let radius = if width == height {
+        half_width
+    } else {
+        10.0 * scale
+    };
+    let qx = dx.abs() - (half_width - radius);
+    let qy = dy.abs() - (half_height - radius);
+    let distance = qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) - radius;
+    (0.5 - distance).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ink::Tool;
+    use crate::ui::ToolbarLayout;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DestroyWindow, IsWindowVisible, WS_EX_LAYERED, WS_EX_TOOLWINDOW, WS_POPUP,
     };
@@ -737,7 +816,7 @@ mod tests {
             });
             linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722
         }
-        for (glyph, neutral, opacity, desktop) in [
+        let mut cases = vec![
             (
                 [250.0, 251.0, 254.0],
                 [26.0, 29.0, 34.0],
@@ -750,7 +829,27 @@ mod tests {
                 LIGHT_TINT_ALPHA,
                 0.0,
             ),
-        ] {
+        ];
+        for progress in [0.0, 0.55, 1.0] {
+            for dark in [false, true] {
+                let [blue, green, red] = air_tint(progress, dark);
+                cases.push((
+                    if dark {
+                        [250.0, 251.0, 254.0]
+                    } else {
+                        [24.0, 27.0, 34.0]
+                    },
+                    [red, green, blue],
+                    if dark {
+                        AIR_DARK_TINT_ALPHA
+                    } else {
+                        AIR_LIGHT_TINT_ALPHA
+                    },
+                    if dark { 255.0 } else { 0.0 },
+                ));
+            }
+        }
+        for (glyph, neutral, opacity, desktop) in cases {
             let background = neutral.map(|channel| mix(desktop, channel, opacity));
             let glyph = luminance(glyph);
             let background = luminance(background);
@@ -763,14 +862,40 @@ mod tests {
     }
 
     #[test]
+    fn air_gradient_keeps_its_length_and_blue_color_in_both_orientations() {
+        for (x, y) in [(0, 0), (25, 19), (240, 30), (479, 59)] {
+            assert_eq!(air_progress(x, y, 480, 60), air_progress(y, x, 60, 480));
+        }
+        let start = air_progress(0, 30, 480, 60);
+        let end = air_progress(479, 30, 480, 60);
+        assert!((end - start - 0.78).abs() < 0.00001);
+        let dark_start = air_tint(start, true);
+        let dark_end = air_tint(end, true);
+        assert!((dark_start[1] - dark_end[1]) * AIR_DARK_TINT_ALPHA > 25.0);
+        for progress in [start, 0.55, end] {
+            for dark in [false, true] {
+                let color = air_tint(progress, dark);
+                assert!(color[0] - color[2] > 25.0);
+                assert!(
+                    color
+                        .into_iter()
+                        .all(|value| (0.0..=255.0).contains(&value))
+                );
+            }
+        }
+    }
+
+    #[test]
     fn glyph_cache_ignores_hover_and_tool_state_but_tracks_color_scale_and_layout() {
         let controls = ToolbarControls {
-            layout: ToolbarLayout::Horizontal,
+            geometry: ToolbarGeometry::default_for(ToolbarLayout::Horizontal),
+            theme: ToolbarTheme::LiquidGlass,
             interactive: false,
             tool: Tool::Pen,
             primary: Color::rgb(16, 32, 48),
             hover: None,
             dark: false,
+            ruler_visible: false,
         };
         let key = GlyphKey::new(1.0, &controls);
         let mut changed = controls;
@@ -782,10 +907,13 @@ mod tests {
         changed.primary = Color::rgb(255, 255, 255);
         assert!(key != GlyphKey::new(1.0, &changed));
         changed = controls;
-        changed.layout = ToolbarLayout::Vertical;
+        changed.geometry = changed.geometry.with_layout(ToolbarLayout::Vertical);
         assert!(key != GlyphKey::new(1.0, &changed));
         changed = controls;
         changed.dark = true;
+        assert!(key != GlyphKey::new(1.0, &changed));
+        changed = controls;
+        changed.theme = ToolbarTheme::LiquidAir;
         assert!(key != GlyphKey::new(1.0, &changed));
     }
 
@@ -818,12 +946,14 @@ mod tests {
                 },
                 scale: 1.0,
                 controls: ToolbarControls {
-                    layout: ToolbarLayout::Horizontal,
+                    geometry: ToolbarGeometry::default_for(ToolbarLayout::Horizontal),
+                    theme: ToolbarTheme::LiquidGlass,
                     interactive: false,
                     tool: Tool::Pen,
                     primary: Color::rgb(99, 102, 241),
                     hover: None,
                     dark: false,
+                    ruler_visible: false,
                 },
                 reflection: None,
             };
@@ -845,6 +975,22 @@ mod tests {
                     assert!((pixel >> shift) & 255 <= alpha);
                 }
             }
+            for (kind, dominant_shift) in [(ToolbarButton::Hide, 0), (ToolbarButton::Quit, 16)] {
+                let button = (0..frame.controls.geometry.len())
+                    .find(|&index| frame.controls.button(index) == Some(kind))
+                    .unwrap();
+                let (left, top, _, height) = frame.controls.geometry.button_bounds(button).unwrap();
+                let chip_sample = ((top + height / 2) * 480 + left + 5) as usize;
+                assert_eq!(buffers.glyphs[chip_sample], 0);
+                frame.controls.hover = Some(button);
+                buffers.render(window.0, frame);
+                let pixel = buffers.output.pixels()[chip_sample];
+                assert_ne!(pixel, first[chip_sample]);
+                let dominant = (pixel >> dominant_shift) & 255;
+                assert!(dominant > (pixel >> 8) & 255);
+                assert!(dominant > (pixel >> (16 - dominant_shift)) & 255);
+                assert_eq!(buffers.glyphs.as_ptr(), cached);
+            }
             frame.controls.hover = Some(5);
             frame.controls.interactive = true;
             frame.controls.tool = Tool::Eraser;
@@ -852,6 +998,19 @@ mod tests {
             assert_eq!(buffers.glyphs.as_ptr(), cached);
             assert_ne!(buffers.output.pixels(), first);
             assert_eq!(IsWindowVisible(window.0), 0);
+            let glass = buffers.output.pixels().to_vec();
+            frame.controls.theme = ToolbarTheme::LiquidAir;
+            buffers.render(window.0, frame);
+            assert_ne!(buffers.output.pixels(), glass);
+            let tinted = buffers.output.pixels()[12 * 480 + 100];
+            assert_eq!(buffers.glyphs[12 * 480 + 100], 0);
+            assert!((tinted & 255) > (tinted >> 16) & 255);
+            for pixel in buffers.output.pixels() {
+                let alpha = *pixel >> 24;
+                for shift in [0, 8, 16] {
+                    assert!((*pixel >> shift) & 255 <= alpha);
+                }
+            }
         }
     }
 }

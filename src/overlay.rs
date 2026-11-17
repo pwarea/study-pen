@@ -5,7 +5,10 @@
 
 use crate::ink::{Ink, Stroke};
 use std::{ffi::c_void, marker::PhantomData, mem::size_of, ptr, rc::Rc};
-use tiny_skia::{FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, Transform};
+use tiny_skia::{
+    BlendMode, FillRule, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap, PixmapPaint,
+    Transform,
+};
 use windows_sys::Win32::{
     Foundation::{HWND, POINT, RECT, SIZE},
     Graphics::Gdi::{
@@ -81,6 +84,15 @@ struct PreparedStroke {
     paint: Paint<'static>,
     width: f32,
     dot: bool,
+    fill: Option<Paint<'static>>,
+    erasures: Vec<PreparedErase>,
+}
+
+struct PreparedErase {
+    bounds: Rect,
+    path: Path,
+    width: f32,
+    dot: bool,
 }
 
 impl PreparedStroke {
@@ -100,7 +112,7 @@ impl PreparedStroke {
         let dot = stroke.points.len() == 1;
         if dot {
             builder.push_circle(first.x, first.y, stroke.width * 0.5);
-        } else if optimize {
+        } else if optimize && !stroke.closed {
             // Keep complete line segments rather than clipping their endpoints:
             // this preserves the exact joins and numerical geometry of the
             // original stroke. Extra radius and neighboring segments place any
@@ -142,19 +154,90 @@ impl PreparedStroke {
             for point in &stroke.points[1..] {
                 builder.line_to(point.x, point.y);
             }
+            if stroke.closed {
+                builder.close();
+            }
         }
         let mut paint = Paint::default();
         // GDI expects BGRA; swapping here avoids a second full-screen buffer
         // or a channel conversion while copying the finished tile.
         paint.set_color_rgba8(stroke.color.b, stroke.color.g, stroke.color.r, 255);
         paint.anti_alias = true;
+        let fill = stroke.fill.map(|color| {
+            let mut paint = Paint::default();
+            paint.set_color_rgba8(color.b, color.g, color.r, 255);
+            paint.anti_alias = true;
+            paint
+        });
+        let erasures = stroke
+            .erasures
+            .iter()
+            .filter_map(|cut| {
+                let bounds = Rect::around(cut.from.x, cut.from.y, cut.radius + 2.0)
+                    .union(Rect::around(cut.to.x, cut.to.y, cut.radius + 2.0));
+                if !bounds.intersects(dirty) {
+                    return None;
+                }
+                let mut path = PathBuilder::new();
+                let dot = cut.from == cut.to;
+                if dot {
+                    path.push_circle(cut.from.x, cut.from.y, cut.radius);
+                } else {
+                    path.move_to(cut.from.x, cut.from.y);
+                    path.line_to(cut.to.x, cut.to.y);
+                }
+                Some(PreparedErase {
+                    bounds,
+                    path: path.finish()?,
+                    width: cut.radius * 2.0,
+                    dot,
+                })
+            })
+            .collect();
         Some(Self {
             bounds,
             path: builder.finish()?,
             paint,
             width: stroke.width,
             dot,
+            fill,
+            erasures,
         })
+    }
+
+    fn paint(&self, target: &mut Pixmap, transform: Transform) {
+        if let Some(fill) = &self.fill {
+            target.fill_path(&self.path, fill, FillRule::Winding, transform, None);
+        }
+        paint_path(
+            target,
+            &self.path,
+            &self.paint,
+            self.width,
+            self.dot,
+            transform,
+        );
+    }
+}
+
+fn paint_path(
+    target: &mut Pixmap,
+    path: &Path,
+    paint: &Paint<'_>,
+    width: f32,
+    dot: bool,
+    transform: Transform,
+) {
+    if dot {
+        target.fill_path(path, paint, FillRule::Winding, transform, None);
+    } else {
+        let style = tiny_skia::Stroke {
+            width,
+            line_cap: LineCap::Round,
+            line_join: LineJoin::Round,
+            ..Default::default()
+        };
+        target.stroke_path(path, paint, &style, transform, None);
     }
 }
 
@@ -169,6 +252,7 @@ pub struct Renderer {
     old_bitmap: HGDIOBJ,
     bits: *mut u8,
     scratch: Pixmap,
+    object_scratch: Option<Pixmap>,
     interactive: Option<bool>,
     _main_thread: PhantomData<Rc<()>>,
 }
@@ -240,6 +324,7 @@ impl Renderer {
             old_bitmap,
             bits: bits.cast(),
             scratch,
+            object_scratch: None,
             interactive: None,
             _main_thread: PhantomData,
         })
@@ -292,29 +377,39 @@ impl Renderer {
                     if !stroke.bounds.intersects(bounds) {
                         continue;
                     }
-                    if stroke.dot {
-                        self.scratch.fill_path(
-                            &stroke.path,
-                            &stroke.paint,
-                            FillRule::Winding,
-                            transform,
-                            None,
-                        );
-                    } else {
-                        let style = tiny_skia::Stroke {
-                            width: stroke.width,
-                            line_cap: LineCap::Round,
-                            line_join: LineJoin::Round,
-                            ..Default::default()
-                        };
-                        self.scratch.stroke_path(
-                            &stroke.path,
-                            &stroke.paint,
-                            &style,
-                            transform,
-                            None,
-                        );
+                    if stroke.erasures.is_empty() {
+                        stroke.paint(&mut self.scratch, transform);
+                        continue;
                     }
+                    // Erasing a filled shape must reveal earlier scene items,
+                    // rather than clearing their pixels from the shared tile.
+                    if self.object_scratch.is_none() {
+                        self.object_scratch =
+                            Some(Pixmap::new(SCRATCH, SCRATCH).ok_or_else(|| {
+                                "Could not allocate the shape render tile.".to_owned()
+                            })?);
+                    }
+                    let object = self.object_scratch.as_mut().expect("The shape tile exists");
+                    object.fill(tiny_skia::Color::TRANSPARENT);
+                    stroke.paint(object, transform);
+                    let clear = Paint {
+                        blend_mode: BlendMode::Clear,
+                        anti_alias: true,
+                        ..Default::default()
+                    };
+                    for cut in &stroke.erasures {
+                        if cut.bounds.intersects(bounds) {
+                            paint_path(object, &cut.path, &clear, cut.width, cut.dot, transform);
+                        }
+                    }
+                    self.scratch.draw_pixmap(
+                        0,
+                        0,
+                        object.as_ref(),
+                        &PixmapPaint::default(),
+                        Transform::identity(),
+                        None,
+                    );
                 }
                 let source = self.scratch.data();
                 for y in copy_top..copy_bottom {
@@ -696,5 +791,82 @@ mod tests {
             }
         }
         assert_eq!(unsafe { IsWindowVisible(window.hwnd) }, 0);
+    }
+
+    #[test]
+    fn shape_preview_fill_and_pixel_holes_match_full_and_partial_repaints() {
+        let window = HiddenWindow::new();
+        let mut renderer = unsafe { Renderer::new(window.hwnd, 0, 0, 512, 256) }.unwrap();
+        let mut ink = Ink::new();
+        let outline = Color::rgb(25, 95, 230);
+        let fill = Color::rgb(240, 90, 45);
+        ink.begin_shape(
+            Point::new(30.0, 30.0),
+            crate::ink::ShapeKind::Rectangle,
+            outline,
+            6.0,
+        );
+        ink.extend(Point::new(480.0, 220.0));
+        renderer.render(&ink, false, None).unwrap();
+        assert_eq!(pixel(&renderer, 30, 100), [230, 95, 25, 255]);
+        assert_eq!(pixel(&renderer, 100, 100), [0, 0, 0, 0]);
+        ink.end();
+        ink.fill_at(Point::new(100.0, 100.0), fill).unwrap();
+        renderer.render(&ink, false, None).unwrap();
+        assert_eq!(pixel(&renderer, 100, 100), [45, 90, 240, 255]);
+        assert_eq!(pixel(&renderer, 30, 100), [230, 95, 25, 255]);
+
+        ink.begin(Point::new(252.0, 128.0), Tool::Eraser, fill, 24.0);
+        ink.extend(Point::new(290.0, 128.0));
+        ink.end();
+        let dirty = Rect::new(235, 110, 308, 146);
+        renderer.render(&ink, false, Some(dirty)).unwrap();
+        assert_eq!(pixel(&renderer, 256, 128), [0, 0, 0, 0]);
+        assert_eq!(pixel(&renderer, 285, 128), [0, 0, 0, 0]);
+        assert_eq!(pixel(&renderer, 320, 128), [45, 90, 240, 255]);
+        assert_eq!(pixel(&renderer, 30, 100), [230, 95, 25, 255]);
+        let partial = unsafe { std::slice::from_raw_parts(renderer.bits, 512 * 256 * 4).to_vec() };
+        renderer.render(&ink, false, None).unwrap();
+        let full = unsafe { std::slice::from_raw_parts(renderer.bits, 512 * 256 * 4) };
+        assert_eq!(
+            partial, full,
+            "Shape cutouts must keep identical coverage across dirty tile boundaries"
+        );
+
+        assert!(ink.undo());
+        renderer.render(&ink, false, Some(dirty)).unwrap();
+        assert_eq!(pixel(&renderer, 256, 128), [45, 90, 240, 255]);
+        assert!(ink.undo());
+        renderer.render(&ink, false, None).unwrap();
+        assert_eq!(pixel(&renderer, 100, 100), [0, 0, 0, 0]);
+        assert_eq!(pixel(&renderer, 30, 100), [230, 95, 25, 255]);
+        assert_eq!(unsafe { IsWindowVisible(window.hwnd) }, 0);
+    }
+
+    #[test]
+    fn closed_shapes_keep_complete_fill_geometry_during_partial_preparation() {
+        let mut ink = Ink::new();
+        ink.begin_shape(
+            Point::new(20.0, 20.0),
+            crate::ink::ShapeKind::Ellipse,
+            Color::rgb(200, 40, 80),
+            4.0,
+        );
+        ink.extend(Point::new(480.0, 230.0));
+        ink.end();
+        ink.fill_at(Point::new(250.0, 120.0), Color::rgb(30, 210, 120))
+            .unwrap();
+        let dirty = Rect::new(245, 110, 265, 140);
+        let stroke = &ink.strokes()[0];
+        let full = PreparedStroke::prepare(stroke, dirty, false).unwrap();
+        let partial = PreparedStroke::prepare(stroke, dirty, true).unwrap();
+        assert_eq!(partial.path, full.path);
+        let mut pixmap = Pixmap::new(512, 256).unwrap();
+        partial.paint(&mut pixmap, Transform::identity());
+        assert_eq!(
+            &pixmap.data()[(120 * 512 + 250) * 4..][..4],
+            &[120, 210, 30, 255]
+        );
+        assert_eq!(&pixmap.data()[(20 * 512 + 20) * 4..][..4], &[0, 0, 0, 0]);
     }
 }

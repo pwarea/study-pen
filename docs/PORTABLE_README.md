@@ -1,4 +1,4 @@
-# Study Pen 0.1.2 — portable user guide
+# Study Pen 0.2.0 — portable user guide
 
 Study Pen is a small native Windows screen annotation app. This package supports Windows 10 and Windows 11 on x86-64 computers. macOS, Linux and native ARM64 builds are not included.
 
@@ -13,6 +13,20 @@ Use the pen button or **Ctrl + Alt + Shift + F1** to draw above other apps. Pres
 Drag the Study Pen handle toward a monitor's left or right side. On the right, its end can move about 32 logical pixels past the edge before the toolbar slides out and back in vertically. The distance scales with the display. If you release before reaching that threshold, the toolbar returns fully on screen in horizontal layout. Pull the top handle away from the edge to move the vertical toolbar continuously with the pointer. It stays vertical until the entire horizontal toolbar would fit inside the usable work area, then returns to horizontal. The top and bottom edges do not request vertical layout.
 
 Antialiased icons stay upright in both layouts and scale with the display. The toolbar scales uniformly to fit the monitor's usable work area, keeping every control accessible on smaller or heavily scaled displays. Its last orientation and position are saved and restored at the next launch.
+
+Open **Settings → Toolbar** to choose **Liquid Glass** or the translucent blue-gradient **Liquid Air** theme. Turn on **Show tool names** for compact labels; hovering always shows the full tool name. Drag items within **On toolbar** to reorder them, from **Available tools** to add them, or back to **Available tools** to remove them. Settings and Quit can move but remain available. **Reset toolbar** restores the default tool list and order; it leaves your theme, labels, colors and shortcuts unchanged.
+
+## Shapes and fill
+
+Add **Shapes** and **Fill shapes** in **Settings → Toolbar**. Click Shapes to choose **Rectangle**, **Ellipse**, **Line**, **Arrow** or **Triangle**, then drag on the screen to draw with the selected color and pen width. The shape menu also supports normal Windows keyboard navigation.
+
+Choose Fill shapes and click inside a rectangle, ellipse or triangle to fill it with the primary color. This fills Study Pen shape objects; it does not fill areas of the underlying app or freehand outlines. The regular eraser removes parts of shapes, the object eraser removes the whole object, and Undo restores drawing, filling and erasing.
+
+## Ruler
+
+Add **Ruler** in **Settings → Toolbar**, then click it to show or hide the ruler. Drag its body to move it. Select the pen and begin a stroke near either long edge to draw a straight line along that edge.
+
+Drag **Rotate** to rotate around the ruler's center, or click it to advance by 15° clockwise. Small angles snap to horizontal; hold **Shift** while rotating for precise angles without that snap. The mouse wheel rotates by 5° per notch. Click the degree readout to reset the angle to exactly **0.0°**; dragging the readout moves the ruler instead. Click its close button to hide it. Its theme follows the toolbar; its angle lasts only for the current app session.
 
 ## Shortcuts
 
@@ -75,13 +89,15 @@ Close Study Pen before manually editing preferences. A full reset requires remov
 
 Release builds check GitHub at startup by default. With **Automatic updates at startup** enabled, a startup window shows the progress of checking and downloading. Study Pen installs a newer portable package automatically when it comes from the build's release repository and passes verification. The updated app restarts with your saved settings.
 
-Choose **Skip for now** during the check or download to open the installed version. Study Pen also opens that version if the feed is unavailable or the package can't be verified. To turn off startup updates, clear **Automatic updates at startup** under **Settings → General**. The first upgrade from 0.1.0 still requires choosing **Install update** in Settings or downloading the new ZIP yourself.
+Choose **Skip for now** during the startup check or download to open the installed version. Study Pen also opens that version if the feed is unavailable or the package can't be verified. To turn off startup updates, clear **Automatic updates at startup** under **Settings → General**.
+
+To check manually, choose **Settings → General → Check for updates**, even when startup updates are disabled. If a newer verified release is available, choose **Install update**. The progress window allows cancellation while preparing the update; installation itself cannot be canceled once replacement begins. Study Pen then closes and restarts the updated copy with its saved preferences. Unverified or unsupported packages use a browser download instead.
 
 If a release only offers a download, close Study Pen before replacing the executable and keep the settings file next to it.
 
 ## Verify the download
 
-The release includes `SHA256SUMS-0.1.2.txt` for its ZIP archives. Compare your ZIP's SHA-256 using this PowerShell command.
+The release includes `SHA256SUMS-0.2.0.txt` for its ZIP archives. Compare your ZIP's SHA-256 using this PowerShell command.
 
 ```powershell
 Get-FileHash .\study-pen-windows-x86_64-portable.zip -Algorithm SHA256
