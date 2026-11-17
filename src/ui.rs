@@ -17,6 +17,8 @@ pub const SHORTCUT_STEP: i32 = 44;
 pub const SHORTCUT_HEIGHT: i32 = 38;
 pub const UPDATE_BUTTON_TOP: i32 = 234;
 pub const UPDATE_BUTTON_BOTTOM: i32 = 270;
+pub const UPDATE_CHECK_RIGHT: i32 = 222;
+pub const UPDATE_ACTION_LEFT: i32 = 236;
 const TOOL_BUTTON_COUNT: usize = 10;
 const BUTTON_STARTS: [i32; TOOL_BUTTON_COUNT] = [51, 91, 131, 171, 218, 258, 305, 345, 392, 432];
 const BUTTON_SIZE: i32 = 38;
@@ -117,6 +119,8 @@ pub struct UiState {
     pub capturing: Option<usize>,
     pub check_for_updates: bool,
     pub installing_update: bool,
+    pub checking_update: bool,
+    pub can_check_updates: bool,
     pub update_message: String,
     pub update_action: Option<&'static str>,
     pub storage_message: String,
@@ -982,20 +986,33 @@ fn general(p: &Painter<'_>, state: &UiState) {
         24.0,
         196.0,
         412.0,
-        if state.update_action.is_some() {
-            36.0
-        } else {
-            69.0
-        },
+        36.0,
         1,
         MUTED,
         DT_WORDBREAK,
     );
+    let top = UPDATE_BUTTON_TOP as f32;
+    let height = (UPDATE_BUTTON_BOTTOM - UPDATE_BUTTON_TOP) as f32;
+    let check_width = (UPDATE_CHECK_RIGHT - 24) as f32;
+    p.rounded(24.0, top, check_width, height, 8.0, SURFACE, BORDER);
+    p.center(
+        if state.checking_update {
+            "Checking…"
+        } else {
+            "Check for updates"
+        },
+        24.0,
+        top,
+        check_width,
+        height,
+        0,
+        if state.can_check_updates { TEXT } else { MUTED },
+    );
     if let Some(action) = state.update_action {
-        let top = UPDATE_BUTTON_TOP as f32;
-        let height = (UPDATE_BUTTON_BOTTOM - UPDATE_BUTTON_TOP) as f32;
-        p.rounded(24.0, top, 412.0, height, 8.0, SURFACE, BORDER);
-        p.center(action, 24.0, top, 412.0, height, 0, TEXT);
+        let left = UPDATE_ACTION_LEFT as f32;
+        let width = 436.0 - left;
+        p.rounded(left, top, width, height, 8.0, SURFACE, BORDER);
+        p.center(action, left, top, width, height, 0, TEXT);
     }
     p.line(&[(24.0, 278.0), (436.0, 278.0)], BORDER, 1.0);
     p.label("Pen width", 24.0, 288.0, 250.0, 5, TEXT);

@@ -5,18 +5,18 @@ use crate::{
     glass::Glass,
     hotkeys, identity,
     ink::{Color, Ink, Point, Tool, eraser_diameter},
-    install_update,
     overlay::{Rect, Renderer},
     radial::{self, WheelStage, WheelState},
     removal::{RemovalImage, RemovalPlan},
     settings::{Action, Hotkey, Settings},
-    startup_update::{self, Launch},
+    startup_update::{self, InstallResult, Installation, Launch},
     toolbar_drag::{DragGeometry, Point as DragPoint},
     toolbar_motion::DockAnimation,
     tray::{self, Tray},
     ui::{
         self, PANEL_HEIGHT, PANEL_WIDTH, SHORTCUT_HEIGHT, SHORTCUT_STEP, SHORTCUT_TOP,
-        ToolbarControls, ToolbarLayout, UPDATE_BUTTON_BOTTOM, UPDATE_BUTTON_TOP, UiState,
+        ToolbarControls, ToolbarLayout, UPDATE_ACTION_LEFT, UPDATE_BUTTON_BOTTOM,
+        UPDATE_BUTTON_TOP, UPDATE_CHECK_RIGHT, UiState,
     },
     updates::{self, ReleaseInfo, UpdateStatus},
 };
@@ -293,7 +293,7 @@ struct App {
     status: String,
     update_status: UpdateStatus,
     update_receiver: Option<mpsc::Receiver<UpdateStatus>>,
-    update_install_receiver: Option<mpsc::Receiver<Result<(), String>>>,
+    update_install: Option<Installation>,
     update_dialog_open: bool,
     update_error: Option<String>,
     syncing_edits: bool,
@@ -558,7 +558,7 @@ unsafe fn run_instance() -> Result<(), String> {
             .unwrap_or_default(),
         update_status,
         update_receiver: None,
-        update_install_receiver: None,
+        update_install: None,
         update_dialog_open: false,
         update_error,
         syncing_edits: false,
@@ -574,12 +574,9 @@ unsafe fn run_instance() -> Result<(), String> {
         app.register_hotkeys();
         app.sync_edits(None);
         app.render(None);
+        app.sync_update_schedule();
         if check_in_background {
-            app.start_updates();
-        } else if app.settings.check_for_updates
-            && updates::repository(app.settings.github_repository.as_deref()).is_some()
-        {
-            SetTimer(toolbar, TIMER_DAILY, DAILY_UPDATE_MS, None);
+            app.start_updates(false);
         }
         app.ensure_tray();
         app.save();
@@ -607,7 +604,12 @@ unsafe fn run_instance() -> Result<(), String> {
         let consumed = APP.with(|cell| {
             let mut guard = cell.borrow_mut();
             let app = guard.as_mut().unwrap();
-            if hotkeys::blocks_menu_beep(message.message, message.wParam) {
+            if app
+                .update_install
+                .as_ref()
+                .is_some_and(|install| install.handle_escape(&message))
+                || hotkeys::blocks_menu_beep(message.message, message.wParam)
+            {
                 true
             } else if matches!(message.message, WM_KEYDOWN | WM_SYSKEYDOWN) {
                 app.key_down(message.wParam as u32)
@@ -656,15 +658,19 @@ impl App {
             hotkey_errors: self.hotkey_errors.clone(),
             capturing: self.capturing,
             check_for_updates: self.settings.check_for_updates,
-            installing_update: self.update_install_receiver.is_some(),
-            update_message: if self.update_install_receiver.is_some() {
-                "Downloading and verifying the update…".into()
-            } else if !self.settings.check_for_updates {
-                "Automatic updates are off.".into()
+            installing_update: self.update_install.is_some(),
+            checking_update: self.update_receiver.is_some(),
+            can_check_updates: self.can_check_updates(),
+            update_message: if let Some(install) = &self.update_install {
+                install.stage().status().into()
             } else if self.update_receiver.is_some() {
                 "Checking GitHub for updates…".into()
             } else if let Some(error) = &self.update_error {
                 error.clone()
+            } else if self.update_status == UpdateStatus::Unconfigured
+                && updates::repository(self.settings.github_repository.as_deref()).is_some()
+            {
+                format!("Version {}", env!("CARGO_PKG_VERSION"))
             } else {
                 self.update_status.message()
             },
@@ -1330,7 +1336,7 @@ impl App {
     }
 
     unsafe fn request_quit(&mut self) {
-        if self.update_install_receiver.is_some() {
+        if self.update_install.is_some() {
             return;
         }
         self.finish_toolbar_animation();
@@ -2197,16 +2203,13 @@ impl App {
             }
             2 => {
                 if (24..436).contains(&x) && (136..182).contains(&y) {
-                    if self.update_install_receiver.is_some() {
+                    if self.update_install.is_some() || self.update_dialog_open {
                         return;
                     }
                     self.settings.check_for_updates = !self.settings.check_for_updates;
+                    self.sync_update_schedule();
                     if self.settings.check_for_updates {
-                        self.start_updates();
-                    } else {
-                        KillTimer(self.toolbar, TIMER_DAILY);
-                        KillTimer(self.toolbar, TIMER_UPDATES);
-                        self.update_receiver = None;
+                        self.start_updates(false);
                     }
                     self.save_later();
                     self.redraw_ui();
@@ -2218,11 +2221,14 @@ impl App {
                     self.request_quit();
                 } else if (236..436).contains(&x) && (528..568).contains(&y) {
                     PostMessageW(self.panel, REMOVE_REQUEST, 0, 0);
-                } else if (24..436).contains(&x)
-                    && (UPDATE_BUTTON_TOP..UPDATE_BUTTON_BOTTOM).contains(&y)
-                    && self.available_update().is_some()
-                {
-                    PostMessageW(self.panel, UPDATE_REQUEST, 0, 0);
+                } else if (UPDATE_BUTTON_TOP..UPDATE_BUTTON_BOTTOM).contains(&y) {
+                    if (24..UPDATE_CHECK_RIGHT).contains(&x) {
+                        self.start_updates(true);
+                    } else if (UPDATE_ACTION_LEFT..436).contains(&x)
+                        && self.available_update().is_some()
+                    {
+                        PostMessageW(self.panel, UPDATE_REQUEST, 0, 0);
+                    }
                 }
             }
             _ => {}
@@ -2272,20 +2278,36 @@ impl App {
         }
     }
 
-    unsafe fn start_updates(&mut self) {
-        if !self.settings.check_for_updates
-            || self.update_receiver.is_some()
-            || self.update_install_receiver.is_some()
+    fn can_check_updates(&self) -> bool {
+        self.update_receiver.is_none()
+            && self.update_install.is_none()
+            && !self.update_dialog_open
+            && !self.removal_dialog_open
+            && !self.removing
+    }
+
+    unsafe fn sync_update_schedule(&self) {
+        if self.settings.check_for_updates
+            && updates::repository(self.settings.github_repository.as_deref()).is_some()
         {
+            SetTimer(self.toolbar, TIMER_DAILY, DAILY_UPDATE_MS, None);
+        } else {
+            KillTimer(self.toolbar, TIMER_DAILY);
+        }
+    }
+
+    unsafe fn start_updates(&mut self, manual: bool) {
+        if !self.can_check_updates() || (!manual && !self.settings.check_for_updates) {
             return;
         }
         self.update_error = None;
         let Some(repository) = updates::repository(self.settings.github_repository.as_deref())
         else {
             self.update_status = UpdateStatus::Unconfigured;
+            self.redraw_ui();
             return;
         };
-        if SetTimer(self.toolbar, TIMER_UPDATES, 500, None) == 0 {
+        if SetTimer(self.toolbar, TIMER_UPDATES, 100, None) == 0 {
             self.update_status = UpdateStatus::Failed("Could not start the update check.".into());
             self.redraw_ui();
             return;
@@ -2295,10 +2317,7 @@ impl App {
         match std::thread::Builder::new().spawn(move || {
             let _ = sender.send(updates::check(Some(&repository), env!("CARGO_PKG_VERSION")));
         }) {
-            Ok(_) => {
-                self.update_receiver = Some(receiver);
-                SetTimer(self.toolbar, TIMER_DAILY, DAILY_UPDATE_MS, None);
-            }
+            Ok(_) => self.update_receiver = Some(receiver),
             Err(_) => {
                 KillTimer(self.toolbar, TIMER_UPDATES);
                 self.update_status =
@@ -2331,11 +2350,7 @@ impl App {
     }
 
     fn available_update(&self) -> Option<(&ReleaseInfo, bool)> {
-        if !self.settings.check_for_updates
-            || self.update_receiver.is_some()
-            || self.update_install_receiver.is_some()
-            || self.update_dialog_open
-        {
+        if !self.can_check_updates() {
             return None;
         }
         match &self.update_status {
@@ -2348,53 +2363,51 @@ impl App {
     }
 
     unsafe fn start_update_install(&mut self, release: ReleaseInfo) {
-        if !release.installable() {
+        if !self.can_check_updates() {
             return;
         }
-        let Some(asset) = release.asset else {
-            return;
-        };
-        if SetTimer(self.toolbar, TIMER_INSTALL_UPDATE, 250, None) == 0 {
+        if SetTimer(
+            self.toolbar,
+            TIMER_INSTALL_UPDATE,
+            startup_update::INSTALL_POLL_MS,
+            None,
+        ) == 0
+        {
             self.update_error = Some("Could not start the update installer.".into());
             self.redraw_ui();
             return;
         }
-        let (sender, receiver) = mpsc::channel();
-        match std::thread::Builder::new()
-            .name("study-pen-update".into())
-            .spawn(move || {
-                let result = install_update::stage(&asset, &release.version)
-                    .and_then(install_update::StagedUpdate::start);
-                let _ = sender.send(result);
-            }) {
-            Ok(_) => {
+        self.toolbar_tips.hide();
+        match Installation::begin(GetModuleHandleW(ptr::null()), self.panel, release) {
+            Ok(install) => {
                 self.update_error = None;
-                self.update_install_receiver = Some(receiver);
+                self.update_install = Some(install);
             }
-            Err(_) => {
+            Err(error) => {
                 KillTimer(self.toolbar, TIMER_INSTALL_UPDATE);
-                self.update_error = Some("Could not start the update installer.".into());
+                self.update_error = Some(error);
             }
         }
         self.redraw_ui();
     }
 
     unsafe fn poll_update_install(&mut self) {
-        let Some(receiver) = &self.update_install_receiver else {
+        let Some(install) = &mut self.update_install else {
             return;
         };
-        let result = match receiver.try_recv() {
-            Ok(result) => result,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                Err("The update installer did not finish.".into())
+        let stage = install.stage();
+        let Some(result) = install.poll() else {
+            if install.stage() != stage {
+                self.redraw_ui();
             }
-            Err(mpsc::TryRecvError::Empty) => return,
+            return;
         };
-        self.update_install_receiver = None;
+        self.update_install = None;
         KillTimer(self.toolbar, TIMER_INSTALL_UPDATE);
         match result {
-            Ok(()) => self.request_quit(),
-            Err(error) => {
+            InstallResult::Canceled => self.redraw_ui(),
+            InstallResult::Finished(Ok(())) => self.request_quit(),
+            InstallResult::Finished(Err(error)) => {
                 self.update_error = Some(error);
                 self.redraw_ui();
             }
@@ -2527,7 +2540,7 @@ unsafe fn request_update(panel: HWND) {
     APP.with(|cell| {
         if let Some(app) = cell.borrow_mut().as_mut() {
             app.update_dialog_open = false;
-            if approved && app.settings.check_for_updates {
+            if approved {
                 app.start_update_install(release);
             }
         }
@@ -2543,7 +2556,7 @@ unsafe fn confirm_removal(panel: HWND) {
             || app.removal_dialog_open
             || app.removing
             || app.update_dialog_open
-            || app.update_install_receiver.is_some()
+            || app.update_install.is_some()
         {
             return None;
         }
@@ -2887,7 +2900,7 @@ unsafe extern "system" fn window_proc(
                     TIMER_ERASER => app.poll_hold(),
                     TIMER_UPDATES => app.poll_updates(),
                     TIMER_INSTALL_UPDATE => app.poll_update_install(),
-                    TIMER_DAILY => app.start_updates(),
+                    TIMER_DAILY => app.start_updates(false),
                     TIMER_SAVE => app.save(),
                     TIMER_TRAY => {
                         if !app.tray.is_added() {
@@ -3025,6 +3038,7 @@ unsafe extern "system" fn window_proc(
             }
             WM_ENDSESSION => {
                 if wparam != 0 {
+                    app.update_install = None;
                     app.request_quit();
                 }
                 0

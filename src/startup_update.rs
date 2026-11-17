@@ -1,10 +1,10 @@
-//! Checks and installs a verified release before opening the toolbar.
+//! Update progress and installation at startup or from Settings.
 
 use crate::{
     install_update,
     settings::Settings,
     splash::{self, Stage},
-    updates::{self, UpdateStatus},
+    updates::{self, ReleaseInfo, UpdateStatus},
 };
 use std::{
     cell::Cell,
@@ -27,8 +27,10 @@ use windows_sys::Win32::{
 const CLASS: &str = "StudyPen.Startup";
 const POLL_TIMER: usize = 1;
 const SKIP_BUTTON: usize = 2;
-const CHECK_LIMIT: Duration = Duration::from_secs(5);
+const CHECK_LIMIT: Duration = Duration::from_secs(10);
 const SPLASH_MINIMUM: Duration = Duration::from_millis(350);
+const DOWNLOAD_MINIMUM: Duration = Duration::from_millis(1200);
+pub const INSTALL_POLL_MS: u32 = 50;
 const RESTART_ARG: &str = "--after-update";
 
 pub enum Launch {
@@ -59,9 +61,12 @@ pub unsafe fn run(settings: &Settings, instance: HINSTANCE) -> Launch {
     if std::env::args_os().any(|arg| arg == RESTART_ARG) {
         return Launch::BackgroundCheck;
     }
-    let Some(window) = Window::new(instance) else {
+    let Some(window) = Window::new(instance, ptr::null_mut()) else {
         return Launch::BackgroundCheck;
     };
+    if SetTimer(window.handle, POLL_TIMER, INSTALL_POLL_MS, None) == 0 {
+        return Launch::BackgroundCheck;
+    }
     window.show();
 
     let repository = repository.to_owned();
@@ -90,7 +95,7 @@ pub unsafe fn run(settings: &Settings, instance: HINSTANCE) -> Launch {
     let version = release.version.clone();
     window.set_stage(Stage::Downloading);
     let result = match worker(move || install_update::stage(&asset, &version)) {
-        Ok(receiver) => window.wait(&receiver, Instant::now(), None),
+        Ok(receiver) => window.wait(&receiver, Instant::now() + DOWNLOAD_MINIMUM, None),
         Err(_) => Wait::Failed,
     };
     let install = match result {
@@ -136,11 +141,107 @@ fn worker<T: Send + 'static>(
 ) -> std::io::Result<Receiver<T>> {
     let (sender, receiver) = mpsc::channel();
     thread::Builder::new()
-        .name("study-pen-startup-update".into())
+        .name("study-pen-update".into())
         .spawn(move || {
             let _ = sender.send(task());
         })?;
     Ok(receiver)
+}
+
+enum InstallWork {
+    Downloading(
+        Receiver<Result<install_update::StagedUpdate, String>>,
+        Instant,
+    ),
+    Installing(Receiver<Result<(), String>>),
+}
+
+pub enum InstallResult {
+    Canceled,
+    Finished(Result<(), String>),
+}
+
+pub struct Installation {
+    window: Window,
+    work: InstallWork,
+}
+
+impl Installation {
+    pub unsafe fn begin(
+        instance: HINSTANCE,
+        owner: HWND,
+        release: ReleaseInfo,
+    ) -> Result<Self, String> {
+        if !release.installable() {
+            return Err("The update package could not be verified.".into());
+        }
+        let asset = release.asset.ok_or("The release has no update package.")?;
+        let window = Window::new(instance, owner).ok_or("Could not open the update screen.")?;
+        window.set_stage(Stage::Downloading);
+        let receiver = worker(move || install_update::stage(&asset, &release.version))
+            .map_err(|_| "Could not start the update download.")?;
+        window.show();
+        Ok(Self {
+            window,
+            work: InstallWork::Downloading(receiver, Instant::now() + DOWNLOAD_MINIMUM),
+        })
+    }
+
+    pub fn stage(&self) -> Stage {
+        self.window.state.stage.get()
+    }
+
+    pub unsafe fn handle_escape(&self, message: &MSG) -> bool {
+        if message.message == WM_KEYDOWN
+            && message.wParam == VK_ESCAPE as usize
+            && (message.hwnd == self.window.handle || message.hwnd == self.window.button)
+        {
+            SendMessageW(self.window.handle, WM_CLOSE, 0, 0);
+            return true;
+        }
+        false
+    }
+
+    pub unsafe fn poll(&mut self) -> Option<InstallResult> {
+        if self.window.state.skipped.get()
+            || (self.window.state.ending_session.get()
+                && matches!(self.work, InstallWork::Downloading(..)))
+        {
+            return Some(InstallResult::Canceled);
+        }
+        match &self.work {
+            InstallWork::Downloading(receiver, ready_at) => {
+                if Instant::now() < *ready_at {
+                    return None;
+                }
+                let staged = match receive_install_result(receiver)? {
+                    Ok(staged) => staged,
+                    Err(error) => return Some(InstallResult::Finished(Err(error))),
+                };
+                self.window.set_stage(Stage::Installing);
+                match worker(move || staged.start()) {
+                    Ok(receiver) => {
+                        self.work = InstallWork::Installing(receiver);
+                        None
+                    }
+                    Err(_) => Some(InstallResult::Finished(Err(
+                        "Could not start the update installer.".into(),
+                    ))),
+                }
+            }
+            InstallWork::Installing(receiver) => {
+                receive_install_result(receiver).map(InstallResult::Finished)
+            }
+        }
+    }
+}
+
+fn receive_install_result<T>(receiver: &Receiver<Result<T, String>>) -> Option<Result<T, String>> {
+    match receiver.try_recv() {
+        Ok(result) => Some(result),
+        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Disconnected) => Some(Err("The update worker did not finish.".into())),
+    }
 }
 
 enum Wait<T> {
@@ -165,7 +266,7 @@ struct Window {
 }
 
 impl Window {
-    unsafe fn new(instance: HINSTANCE) -> Option<Self> {
+    unsafe fn new(instance: HINSTANCE, owner: HWND) -> Option<Self> {
         let name = wide(CLASS);
         let class = WNDCLASSW {
             lpfnWndProc: Some(window_proc),
@@ -174,7 +275,7 @@ impl Window {
             hCursor: LoadCursorW(ptr::null_mut(), IDC_ARROW),
             ..Default::default()
         };
-        if RegisterClassW(&class) == 0 {
+        if RegisterClassW(&class) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS {
             return None;
         }
         let mut state = Box::new(WindowState {
@@ -183,9 +284,13 @@ impl Window {
             skipped: Cell::new(false),
             ending_session: Cell::new(false),
         });
-        let mut cursor = POINT::default();
-        GetCursorPos(&mut cursor);
-        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        let monitor = if owner.is_null() {
+            let mut cursor = POINT::default();
+            GetCursorPos(&mut cursor);
+            MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST)
+        } else {
+            MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST)
+        };
         let mut monitor_info = MONITORINFO {
             cbSize: size_of::<MONITORINFO>() as u32,
             ..Default::default()
@@ -207,7 +312,7 @@ impl Window {
             center_y,
             1,
             1,
-            ptr::null_mut(),
+            owner,
             ptr::null_mut(),
             instance,
             (&raw mut *state).cast(),
@@ -246,7 +351,12 @@ impl Window {
         window.button = CreateWindowExW(
             0,
             wide("BUTTON").as_ptr(),
-            wide("Skip for now").as_ptr(),
+            wide(if owner.is_null() {
+                "Skip for now"
+            } else {
+                "Cancel"
+            })
+            .as_ptr(),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON as u32,
             px(222),
             px(106),
@@ -257,7 +367,7 @@ impl Window {
             instance,
             ptr::null_mut(),
         );
-        if window.button.is_null() || SetTimer(handle, POLL_TIMER, 50, None) == 0 {
+        if window.button.is_null() {
             return None;
         }
         SendMessageW(
@@ -400,7 +510,8 @@ mod tests {
     #[test]
     fn splash_can_skip_download_but_not_the_installer_handoff() {
         unsafe {
-            let window = Window::new(GetModuleHandleW(ptr::null())).expect("create startup window");
+            let window = Window::new(GetModuleHandleW(ptr::null()), ptr::null_mut())
+                .expect("create startup window");
             window.set_stage(Stage::Downloading);
             SendMessageW(
                 window.handle,
@@ -428,6 +539,32 @@ mod tests {
                 window.wait(&receiver, Instant::now(), None),
                 Wait::Ready(())
             ));
+        }
+    }
+
+    #[test]
+    fn manual_install_waits_for_the_splash_and_can_cancel_before_handoff() {
+        unsafe {
+            let instance = GetModuleHandleW(ptr::null());
+            let startup = Window::new(instance, ptr::null_mut()).unwrap();
+            drop(startup);
+            let window = Window::new(instance, ptr::null_mut()).unwrap();
+            window.set_stage(Stage::Downloading);
+            let (sender, receiver) = mpsc::channel();
+            sender.send(Err("Download failed.".into())).unwrap();
+            let mut install = Installation {
+                window,
+                work: InstallWork::Downloading(receiver, Instant::now() + DOWNLOAD_MINIMUM),
+            };
+            assert!(install.poll().is_none());
+            let key = MSG {
+                hwnd: install.window.button,
+                message: WM_KEYDOWN,
+                wParam: VK_ESCAPE as usize,
+                ..Default::default()
+            };
+            assert!(install.handle_escape(&key));
+            assert!(matches!(install.poll(), Some(InstallResult::Canceled)));
         }
     }
 }
