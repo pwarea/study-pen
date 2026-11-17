@@ -1,6 +1,6 @@
 # Platform support
 
-Study Pen 0.1.0 currently supports **Windows 10/11 on x86-64**. Its executable is a Windows PE binary. macOS and Linux builds are not implemented or tested.
+Study Pen supports **Windows 10/11 on x86-64**. Its executable is a Windows PE binary. macOS and Linux builds are not implemented or tested.
 
 Rust supports macOS and Linux targets, so native ports are feasible. That does not make the present Win32 implementation portable by changing a compiler target. The ink geometry and undo model can be shared; windowing, input, drawing presentation, tray integration, settings locations and HTTPS integration need platform backends. [Rust's platform support list](https://doc.rust-lang.org/stable/rustc/platform-support.html) distinguishes compiler support from application support.
 

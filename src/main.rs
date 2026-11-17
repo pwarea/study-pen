@@ -11,6 +11,8 @@ mod overlay;
 mod radial;
 mod removal;
 mod settings;
+mod splash;
+mod startup_update;
 mod toolbar_drag;
 mod toolbar_motion;
 mod tray;

@@ -12,13 +12,18 @@ use std::{
     fmt::Write as _,
     fs,
     io::Write as _,
+    os::windows::io::AsRawHandle,
     path::{Path, PathBuf},
-    process::{self, Stdio},
+    process::{self, Child, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use windows_sys::Win32::{
+    Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT},
+    System::Threading::{GetCurrentProcess, WaitForSingleObject},
+};
 
 pub const MAX_ARCHIVE_BYTES: u64 = 32 * 1024 * 1024;
+const STAGING_TIMEOUT_MS: u32 = 75_000;
 
 #[derive(Serialize)]
 struct StageRequest<'a> {
@@ -138,13 +143,21 @@ fn stage_files(plan: &StageRequest<'_>) -> Result<Fingerprints, String> {
         .stderr(Stdio::null())
         .spawn()
         .map_err(|_| "Could not start the Windows update verifier.")?;
-    let written = child
-        .stdin
-        .take()
-        .is_some_and(|mut stdin| stdin.write_all(&input).is_ok());
-    if !written {
+    let input_writer = child.stdin.take().and_then(|mut stdin| {
+        std::thread::Builder::new()
+            .name("update-staging-input".into())
+            .spawn(move || stdin.write_all(&input))
+            .ok()
+    });
+    let Some(input_writer) = input_writer else {
         let _ = child.kill();
         let _ = child.wait();
+        return Err(
+            "Could not send the download information to the Windows update verifier.".into(),
+        );
+    };
+    wait_for_staging(&mut child, STAGING_TIMEOUT_MS)?;
+    if !matches!(input_writer.join(), Ok(Ok(()))) {
         return Err(
             "Could not send the download information to the Windows update verifier.".into(),
         );
@@ -157,6 +170,17 @@ fn stage_files(plan: &StageRequest<'_>) -> Result<Fingerprints, String> {
     }
     serde_json::from_slice(&output.stdout)
         .map_err(|_| "The Windows update verifier returned an invalid response.".into())
+}
+
+fn wait_for_staging(child: &mut Child, timeout_ms: u32) -> Result<(), String> {
+    let message = match unsafe { WaitForSingleObject(child.as_raw_handle(), timeout_ms) } {
+        WAIT_OBJECT_0 => return Ok(()),
+        WAIT_TIMEOUT => "The update download timed out. You can download it manually from GitHub.",
+        _ => "Could not wait for the Windows update verifier.",
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    Err(message.into())
 }
 
 fn start_helper(plan: &InstallRequest<'_>) -> Result<process::Child, String> {
@@ -307,6 +331,7 @@ function launch($path) {
     $info = [Diagnostics.ProcessStartInfo]::new($path)
     $info.UseShellExecute = $false
     $info.CreateNoWindow = $true
+    $info.Arguments = '--after-update'
     $info.WorkingDirectory = [IO.Path]::GetDirectoryName($path)
     $child = [Diagnostics.Process]::Start($info)
     if (!$child) { throw 'Could not relaunch Study Pen.' }
@@ -324,7 +349,10 @@ try {
         [IO.File]::Exists($plan.backup) -or [IO.Directory]::Exists($plan.backup)) { throw 'An update file changed.' }
     [IO.File]::Replace($plan.staged, $plan.executable, $plan.backup)
     launch $plan.executable
-    if (matches $plan.backup $plan.fingerprints.original) { [IO.File]::Delete($plan.backup) }
+    # A locked backup is recoverable and does not invalidate the active update.
+    try {
+        if (matches $plan.backup $plan.fingerprints.original) { [IO.File]::Delete($plan.backup) }
+    } catch { }
 } catch {
     if (matches $plan.backup $plan.fingerprints.original) {
         try {
@@ -352,18 +380,29 @@ try {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{os::windows::io::AsRawHandle, time::Duration};
+    use std::time::Duration;
 
     const FIXTURE_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 $path = [Console]::In.ReadToEnd()
 Add-Type -OutputAssembly $path -OutputType ConsoleApplication -TypeDefinition @'
+using System.IO;
 using System.Threading;
-public static class Fixture { public static void Main() { Thread.Sleep(2000); } }
+public static class Fixture {
+    public static int Main(string[] args) {
+        if (args.Length != 1 || args[0] != "--after-update") return 2;
+        if (File.Exists("lock-backup")) {
+            using (File.OpenRead("backup.exe")) Thread.Sleep(2500);
+        } else {
+            Thread.Sleep(2000);
+        }
+        return 0;
+    }
+}
 '@
 "#;
 
-    fn fixture_update(should_launch: bool) {
+    fn fixture_update(should_launch: bool, lock_backup: bool) {
         let directory = std::env::temp_dir().join(format!(
             "study-pen-update-test-{}-{}",
             process::id(),
@@ -376,6 +415,7 @@ public static class Fixture { public static void Main() { Thread.Sleep(2000); } 
         let executable = directory.join("study-pen.exe");
         let staged = directory.join("staged.exe");
         let backup = directory.join("backup.exe");
+        let backup_lock = directory.join("lock-backup");
         struct FixtureCleanup(Vec<PathBuf>, PathBuf);
         impl Drop for FixtureCleanup {
             fn drop(&mut self) {
@@ -386,10 +426,18 @@ public static class Fixture { public static void Main() { Thread.Sleep(2000); } 
             }
         }
         let _cleanup = FixtureCleanup(
-            vec![executable.clone(), staged.clone(), backup.clone()],
+            vec![
+                executable.clone(),
+                staged.clone(),
+                backup.clone(),
+                backup_lock.clone(),
+            ],
             directory,
         );
         fs::write(&executable, b"previous copy").unwrap();
+        if lock_backup {
+            fs::write(backup_lock, []).unwrap();
+        }
         if should_launch {
             let mut compiler = helper_command(FIXTURE_SCRIPT)
                 .unwrap()
@@ -452,20 +500,47 @@ public static class Fixture { public static void Main() { Thread.Sleep(2000); } 
                 b"previous copy"
             }
         );
-        assert!(!staged.exists() && !backup.exists());
+        assert!(!staged.exists());
+        if lock_backup {
+            assert_eq!(fs::read(&backup).unwrap(), b"previous copy");
+        } else {
+            assert!(!backup.exists());
+        }
         // The successful fixture briefly keeps the staged image mapped.
         if should_launch {
-            std::thread::sleep(Duration::from_secs(1));
+            std::thread::sleep(Duration::from_millis(if lock_backup { 1500 } else { 1000 }));
         }
     }
 
     #[test]
     fn deferred_update_rolls_back_and_preserves_previous_executable_after_launch_failure() {
-        fixture_update(false);
+        fixture_update(false, false);
     }
 
     #[test]
     fn deferred_update_replaces_only_after_owner_exits_and_relaunches() {
-        fixture_update(true);
+        fixture_update(true, false);
+    }
+
+    #[test]
+    fn a_locked_backup_does_not_roll_back_a_successful_update() {
+        fixture_update(true, true);
+    }
+
+    #[test]
+    fn staging_timeout_stops_the_blocked_verifier() {
+        let mut child = helper_command("[void][Console]::In.ReadToEnd()")
+            .unwrap()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(
+            wait_for_staging(&mut child, 25)
+                .unwrap_err()
+                .contains("timed out")
+        );
+        assert!(child.try_wait().unwrap().is_some());
     }
 }

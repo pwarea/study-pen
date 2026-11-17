@@ -37,7 +37,9 @@ Preferences travel with the app in `study-pen.settings.json`. To remove a copy a
 
 ## Updates
 
-Release builds check GitHub on startup by default. Turn off **Check for updates** in **Settings → General**. When a release is available, open Settings to install it. Study Pen asks before restarting.
+Release builds check GitHub on startup by default. From 0.1.1, Study Pen shows update progress before opening the toolbar and automatically installs a newer, verified portable package from its release repository. Choose **Skip for now** while it checks or downloads to use your installed version. Switch off **Automatic updates at startup** under **Settings → General** to opt out.
+
+If the update feed is unavailable or an update can't be verified, Study Pen opens the installed version. To upgrade from 0.1.0, first choose **Install update** in **Settings → General**, or download the new portable ZIP.
 
 ## Build
 

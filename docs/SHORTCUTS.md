@@ -1,6 +1,6 @@
 # Shortcut compatibility
 
-Study Pen 0.1.0 uses function-key shortcuts with three modifiers for its eight existing actions. The optional radial-menu shortcut starts unassigned. These defaults reduce collisions with common Windows commands and character entry. Other utilities and application settings can still conflict; registration must be checked on the computer where Study Pen runs.
+Study Pen uses function-key shortcuts with three modifiers for its eight existing actions. The optional radial-menu shortcut starts unassigned. These defaults reduce collisions with common Windows commands and character entry. Other utilities and application settings can still conflict; registration must be checked on the computer where Study Pen runs.
 
 | Action | Default shortcut |
 | --- | --- |

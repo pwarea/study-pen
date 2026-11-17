@@ -956,7 +956,7 @@ fn general(p: &Painter<'_>, state: &UiState) {
         );
     }
     p.label(
-        "Check for updates automatically",
+        "Automatic updates at startup",
         58.0,
         143.0,
         378.0,

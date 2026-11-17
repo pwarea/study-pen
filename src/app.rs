@@ -10,6 +10,7 @@ use crate::{
     radial::{self, WheelStage, WheelState},
     removal::{RemovalImage, RemovalPlan},
     settings::{Action, Hotkey, Settings},
+    startup_update::{self, Launch},
     toolbar_drag::{DragGeometry, Point as DragPoint},
     toolbar_motion::DockAnimation,
     tray::{self, Tray},
@@ -58,6 +59,7 @@ const TIMER_RADIAL: usize = 7;
 const TIMER_DOCK: usize = 8;
 const TIMER_GLASS: usize = 9;
 const TIMER_INSTALL_UPDATE: usize = 10;
+const DAILY_UPDATE_MS: u32 = 86_400_000;
 const GLASS_REFRESH_MS: u32 = 100;
 const REMOVE_REQUEST: u32 = WM_APP + 20;
 const UPDATE_REQUEST: u32 = WM_APP + 21;
@@ -285,6 +287,17 @@ pub fn run() -> Result<(), String> {
 unsafe fn run_instance() -> Result<(), String> {
     let removal_image = RemovalImage::capture();
     let identity_error = identity::set_process_identity().err();
+    let instance = GetModuleHandleW(ptr::null());
+    let mut settings = Settings::load();
+    let (update_status, update_error, check_in_background) =
+        match startup_update::run(&settings, instance) {
+            Launch::BackgroundCheck => (UpdateStatus::Unconfigured, None, true),
+            Launch::Open {
+                status,
+                install_error,
+            } => (status, install_error, false),
+            Launch::Exit => return Ok(()),
+        };
     let shortcut_error = if cfg!(debug_assertions) {
         None
     } else {
@@ -296,7 +309,6 @@ unsafe fn run_instance() -> Result<(), String> {
             Err(error) => Some(error),
         }
     };
-    let instance = GetModuleHandleW(ptr::null());
     for name in [TOOLBAR_CLASS, PANEL_CLASS, OVERLAY_CLASS, RADIAL_CLASS] {
         let class_name = wide(name);
         let class = WNDCLASSW {
@@ -313,7 +325,6 @@ unsafe fn run_instance() -> Result<(), String> {
     }
     let scale = (GetDpiForSystem() as f32 / 96.0).max(1.0);
     let px = |n: i32| (n as f32 * scale).round() as i32;
-    let mut settings = Settings::load();
     let desktop_error = if cfg!(debug_assertions) || settings.desktop_shortcut_seen {
         None
     } else {
@@ -502,11 +513,11 @@ unsafe fn run_instance() -> Result<(), String> {
             .or(shortcut_error)
             .or(identity_error)
             .unwrap_or_default(),
-        update_status: UpdateStatus::Unconfigured,
+        update_status,
         update_receiver: None,
         update_install_receiver: None,
         update_dialog_open: false,
-        update_error: None,
+        update_error,
         syncing_edits: false,
         removal_image,
         removal_dialog_open: false,
@@ -520,7 +531,13 @@ unsafe fn run_instance() -> Result<(), String> {
         app.register_hotkeys();
         app.sync_edits(None);
         app.render(None);
-        app.start_updates();
+        if check_in_background {
+            app.start_updates();
+        } else if app.settings.check_for_updates
+            && updates::repository(app.settings.github_repository.as_deref()).is_some()
+        {
+            SetTimer(toolbar, TIMER_DAILY, DAILY_UPDATE_MS, None);
+        }
         app.ensure_tray();
         app.save();
         if ui_visible {
@@ -600,7 +617,7 @@ impl App {
             update_message: if self.update_install_receiver.is_some() {
                 "Downloading and verifying the update…".into()
             } else if !self.settings.check_for_updates {
-                "Automatic checks are off.".into()
+                "Automatic updates are off.".into()
             } else if self.update_receiver.is_some() {
                 "Checking GitHub for updates…".into()
             } else if let Some(error) = &self.update_error {
@@ -2232,7 +2249,7 @@ impl App {
         }) {
             Ok(_) => {
                 self.update_receiver = Some(receiver);
-                SetTimer(self.toolbar, TIMER_DAILY, 86_400_000, None);
+                SetTimer(self.toolbar, TIMER_DAILY, DAILY_UPDATE_MS, None);
             }
             Err(_) => {
                 KillTimer(self.toolbar, TIMER_UPDATES);

@@ -1,4 +1,4 @@
-# Study Pen 0.1.0 — portable user guide
+# Study Pen 0.1.1 — portable user guide
 
 Study Pen is a small native Windows screen annotation app. This package supports Windows 10 and Windows 11 on x86-64 computers. macOS, Linux and native ARM64 builds are not included.
 
@@ -71,11 +71,15 @@ Close Study Pen before manually editing preferences. A full reset requires remov
 
 ## Updates
 
-Release builds check GitHub each time they start. Turn off **Check for updates** under **Settings → General**. Select **Install update** to confirm the update and restart. If the release only offers a download, close Study Pen before replacing the executable and keep the settings file next to it.
+Release builds check GitHub at startup by default. With **Automatic updates at startup** enabled, a startup window shows the progress of checking and downloading. Study Pen installs a newer portable package automatically when it comes from the build's release repository and passes verification. The updated app restarts with your saved settings.
+
+Choose **Skip for now** during the check or download to open the installed version. Study Pen also opens that version if the feed is unavailable or the package can't be verified. To turn off startup updates, clear **Automatic updates at startup** under **Settings → General**. The first upgrade from 0.1.0 still requires choosing **Install update** in Settings or downloading the new ZIP yourself.
+
+If a release only offers a download, close Study Pen before replacing the executable and keep the settings file next to it.
 
 ## Verify the download
 
-The release includes `SHA256SUMS-0.1.0.txt` for its ZIP archives. Compare your ZIP's SHA-256 using PowerShell:
+The release includes `SHA256SUMS-0.1.1.txt` for its ZIP archives. Compare your ZIP's SHA-256 using this PowerShell command.
 
 ```powershell
 Get-FileHash .\study-pen-windows-x86_64-portable.zip -Algorithm SHA256
