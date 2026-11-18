@@ -38,6 +38,8 @@ const TEXT_SIZE_DIP: f32 = 16.0;
 const ZERO_SNAP_ENTER_DEGREES: f32 = 1.5;
 const ZERO_SNAP_RELEASE_DEGREES: f32 = 2.5;
 const MK_SHIFT_FLAG: WPARAM = 0x0004;
+const PEN_AA_MARGIN: f64 = 1.0;
+const PEN_SNAP_CLEARANCE: f64 = 0.02;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HitTarget {
@@ -47,22 +49,106 @@ enum HitTarget {
     Close,
 }
 
-/// Captures the chosen long edge at pen-down, independently of later ruler moves.
+/// A screen-space snapshot of the ruler for one pen gesture. The padded body
+/// excludes the pen's round footprint, even when a sparse sample crosses it.
 #[derive(Clone, Copy, Debug)]
-pub struct RulerSnap {
-    origin: Point,
-    direction: Point,
+pub struct RulerPen {
+    center: Point,
+    direction: [f64; 2],
+    half_length: f64,
+    half_thickness: f64,
+    padding: f64,
+    snap_y: Option<f64>,
 }
 
-impl RulerSnap {
-    /// Projects onto the same infinite straight line for the whole gesture.
-    pub fn project(self, point: POINT) -> POINT {
-        let distance = (point.x as f32 - self.origin.x) * self.direction.x
-            + (point.y as f32 - self.origin.y) * self.direction.y;
-        POINT {
-            x: (self.origin.x + self.direction.x * distance).round() as i32,
-            y: (self.origin.y + self.direction.y * distance).round() as i32,
+impl RulerPen {
+    fn new(geometry: Geometry, start: Point, radius: f32) -> Option<Self> {
+        if !start.x.is_finite() || !start.y.is_finite() || !radius.is_finite() || radius < 0.0 {
+            return None;
         }
+        let (sin, cos) = f64::from(geometry.angle).sin_cos();
+        let mut guide = Self {
+            center: geometry.center,
+            direction: [cos, sin],
+            half_length: f64::from(geometry.length) * 0.5,
+            half_thickness: f64::from(geometry.thickness) * 0.5,
+            padding: f64::from(radius) + PEN_AA_MARGIN.max(0.6 * f64::from(geometry.scale) + 0.5),
+            snap_y: None,
+        };
+        let [x, y] = guide.local(start);
+        let distance = y.abs() - guide.half_thickness;
+        // A press on the ruler itself belongs to its controls. Beyond either
+        // short end, freehand remains freehand rather than attracting to a line.
+        if x.abs() <= guide.half_length
+            && distance > 0.0
+            && distance <= f64::from(SNAP_DISTANCE * geometry.scale) + guide.padding
+        {
+            guide.snap_y =
+                Some(y.signum() * (guide.half_thickness + guide.padding + PEN_SNAP_CLEARANCE));
+        }
+        Some(guide)
+    }
+
+    fn local(self, point: Point) -> [f64; 2] {
+        let x = f64::from(point.x) - f64::from(self.center.x);
+        let y = f64::from(point.y) - f64::from(self.center.y);
+        let [cos, sin] = self.direction;
+        [x * cos + y * sin, -x * sin + y * cos]
+    }
+
+    /// Keeps freehand coordinates intact, or projects onto the selected long
+    /// edge outside the padded body. Coordinates remain fractional pixels.
+    pub fn project(self, point: Point) -> Point {
+        let Some(y) = self.snap_y else {
+            return point;
+        };
+        let [x, _] = self.local(point);
+        let [cos, sin] = self.direction;
+        Point::new(
+            (f64::from(self.center.x) + x * cos - y * sin) as f32,
+            (f64::from(self.center.y) + x * sin + y * cos) as f32,
+        )
+    }
+
+    /// The rectangular exclusion is deliberately conservative at the ruler's
+    /// rounded corners, keeping the complete pen footprint off its material.
+    pub fn blocks(self, point: Point) -> bool {
+        let [x, y] = self.local(point);
+        x.abs() <= self.half_length + self.padding && y.abs() <= self.half_thickness + self.padding
+    }
+
+    /// Returns the inclusive parameter interval covered by the padded body.
+    /// Both endpoints may be outside: callers must split a path across this
+    /// interval, rather than connect its visible parts through the ruler.
+    pub fn blocked_range(self, from: Point, to: Point) -> Option<[f32; 2]> {
+        if ![from.x, from.y, to.x, to.y].into_iter().all(f32::is_finite) {
+            return None;
+        }
+        let from = self.local(from);
+        let to = self.local(to);
+        let limits = [
+            self.half_length + self.padding,
+            self.half_thickness + self.padding,
+        ];
+        let mut enter = 0.0_f64;
+        let mut leave = 1.0_f64;
+        for axis in 0..2 {
+            let delta = to[axis] - from[axis];
+            if delta.abs() <= f64::EPSILON {
+                if from[axis].abs() > limits[axis] {
+                    return None;
+                }
+                continue;
+            }
+            let a = (-limits[axis] - from[axis]) / delta;
+            let b = (limits[axis] - from[axis]) / delta;
+            enter = enter.max(a.min(b));
+            leave = leave.min(a.max(b));
+            if enter > leave {
+                return None;
+            }
+        }
+        Some([enter as f32, leave as f32])
     }
 }
 
@@ -183,23 +269,6 @@ impl Geometry {
         } else {
             Some(HitTarget::Move)
         }
-    }
-
-    fn snap(self, point: POINT) -> Option<RulerSnap> {
-        let local = self.local(point);
-        let threshold = SNAP_DISTANCE * self.scale;
-        if local.x.abs() > self.length * 0.5 + threshold {
-            return None;
-        }
-        let edge_y = self.thickness * 0.5 * if local.y < 0.0 { -1.0 } else { 1.0 };
-        if (local.y - edge_y).abs() > threshold {
-            return None;
-        }
-        let (sin, cos) = self.angle.sin_cos();
-        Some(RulerSnap {
-            origin: self.screen(0.0, edge_y),
-            direction: Point::new(cos, sin),
-        })
     }
 }
 
@@ -653,9 +722,10 @@ impl Ruler {
         Ok(())
     }
 
-    pub fn snap(&self, point: POINT) -> Option<RulerSnap> {
+    /// Captures the visible ruler in physical screen pixels for one pen stroke.
+    pub fn pen_guide(&self, start: Point, radius: f32) -> Option<RulerPen> {
         self.is_visible()
-            .then(|| self.state.geometry.get().snap(point))
+            .then(|| RulerPen::new(self.state.geometry.get(), start, radius))
             .flatten()
     }
 }
@@ -1387,50 +1457,141 @@ mod tests {
     #[test]
     fn horizontal_snap_uses_nearest_long_edge_and_rejects_remote_points() {
         let ruler = geometry(0.0, 1.0);
-        let top = ruler.snap(POINT { x: 600, y: 359 }).unwrap();
-        let projected = top.project(POINT { x: 640, y: 490 });
-        assert_eq!((projected.x, projected.y), (640, 364));
-        let bottom = ruler.snap(POINT { x: 600, y: 441 }).unwrap();
-        let projected = bottom.project(POINT { x: 620, y: 200 });
-        assert_eq!((projected.x, projected.y), (620, 436));
-        assert!(ruler.snap(POINT { x: 500, y: 400 }).is_none());
-        assert!(ruler.snap(POINT { x: 900, y: 364 }).is_none());
-        assert!(ruler.snap(POINT { x: 500, y: 349 }).is_none());
+        for (start_y, side) in [(359.0, -1.0), (441.0, 1.0)] {
+            let guide = RulerPen::new(ruler, Point::new(600.0, start_y), 4.0).unwrap();
+            let projected = guide.project(Point::new(640.25, 490.0));
+            assert_eq!(projected.x, 640.25);
+            let expected = 400.0 + side * (36.0 + 5.1 + PEN_SNAP_CLEARANCE as f32);
+            assert!((projected.y - expected).abs() < 0.001);
+            assert!(!guide.blocks(projected));
+        }
+        for start in [
+            Point::new(500.0, 400.0),
+            Point::new(900.0, 364.0),
+            Point::new(500.0, 340.0),
+            Point::new(500.0, 364.0),
+        ] {
+            let guide = RulerPen::new(ruler, start, 4.0).unwrap();
+            assert!(guide.snap_y.is_none());
+            assert_eq!(guide.project(start), start);
+        }
     }
 
     #[test]
     fn rotated_snap_and_snapshot_stay_on_the_selected_edge() {
         let mut ruler = geometry(45.0_f32.to_radians(), 1.0);
         let near_edge = ruler.screen(120.0, -40.0);
-        let snap = ruler
-            .snap(POINT {
-                x: near_edge.x.round() as i32,
-                y: near_edge.y.round() as i32,
-            })
-            .unwrap();
+        let snap = RulerPen::new(ruler, near_edge, 8.0).unwrap();
+        assert!(snap.snap_y.is_some());
         ruler.center = Point::new(900.0, 900.0);
         ruler.angle = 0.0;
-        assert!(
-            ruler
-                .snap(POINT {
-                    x: near_edge.x.round() as i32,
-                    y: near_edge.y.round() as i32,
-                })
-                .is_none()
-        );
-        let projected = snap.project(POINT { x: 700, y: 200 });
-        let original = geometry(45.0_f32.to_radians(), 1.0);
-        let local = original.local(projected);
-        assert!((local.y + 36.0).abs() <= 0.8);
-        let later = snap.project(POINT { x: 1700, y: -500 });
-        assert!((original.local(later).y + 36.0).abs() <= 0.8);
+        let changed = RulerPen::new(ruler, near_edge, 8.0).unwrap();
+        assert!(changed.snap_y.is_none());
+        let projected = snap.project(Point::new(700.0, 200.0));
+        assert!((snap.local(projected)[1] + 45.12).abs() < 0.001);
+        let later = snap.project(Point::new(1700.0, -500.0));
+        assert!((snap.local(later)[1] + 45.12).abs() < 0.001);
+        assert!(!snap.blocks(projected));
+        assert!(!snap.blocks(later));
+        assert!(snap.blocked_range(projected, later).is_none());
     }
 
     #[test]
     fn snapping_distance_scales_with_the_display() {
         let ruler = geometry(0.0, 2.0);
-        assert!(ruler.snap(POINT { x: 500, y: 300 }).is_some());
-        assert!(ruler.snap(POINT { x: 500, y: 299 }).is_none());
+        let edge = ruler.center.y - ruler.thickness * 0.5;
+        let near = RulerPen::new(ruler, Point::new(500.0, edge - 28.0), 0.0).unwrap();
+        let far = RulerPen::new(ruler, Point::new(500.0, edge - 30.0), 0.0).unwrap();
+        assert!(near.snap_y.is_some());
+        assert!(far.snap_y.is_none());
+        assert!((near.padding - 1.7).abs() < 0.001);
+    }
+
+    #[test]
+    fn sparse_crossings_clip_both_outside_endpoints_and_reverse_symmetrically() {
+        let ruler = geometry(0.0, 1.0);
+        let guide = RulerPen::new(ruler, Point::new(500.0, 100.0), 4.0).unwrap();
+        let from = Point::new(500.0, 200.0);
+        let to = Point::new(500.0, 600.0);
+        assert!(!guide.blocks(from) && !guide.blocks(to));
+        let [enter, leave] = guide.blocked_range(from, to).unwrap();
+        assert!((enter - 0.39725).abs() < 0.00001);
+        assert!((leave - 0.60275).abs() < 0.00001);
+        let reversed = guide.blocked_range(to, from).unwrap();
+        assert!((reversed[0] - (1.0 - leave)).abs() < 0.00001);
+        assert!((reversed[1] - (1.0 - enter)).abs() < 0.00001);
+        let across_ends = guide
+            .blocked_range(Point::new(0.0, 400.0), Point::new(1000.0, 400.0))
+            .unwrap();
+        assert!((across_ends[0] - 0.1749).abs() < 0.00001);
+        assert!((across_ends[1] - 0.8251).abs() < 0.00001);
+    }
+
+    #[test]
+    fn clipped_ranges_cover_inside_taps_partial_exits_and_parallel_misses() {
+        let ruler = geometry(0.0, 1.0);
+        let guide = RulerPen::new(ruler, Point::new(0.0, 0.0), 3.0).unwrap();
+        let center = ruler.center;
+        assert!(guide.blocks(center));
+        assert_eq!(guide.blocked_range(center, center), Some([0.0, 1.0]));
+        let exit = guide
+            .blocked_range(center, Point::new(center.x, center.y + 200.0))
+            .unwrap();
+        assert_eq!(exit[0], 0.0);
+        assert!((exit[1] - 0.2005).abs() < 0.00001);
+        assert!(
+            guide
+                .blocked_range(Point::new(100.0, 300.0), Point::new(900.0, 300.0))
+                .is_none()
+        );
+        let outside = Point::new(0.0, 0.0);
+        assert_eq!(guide.project(outside), outside);
+        assert!(guide.blocked_range(outside, outside).is_none());
+    }
+
+    #[test]
+    fn rotated_negative_origin_guides_keep_both_snapped_sides_clear() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            for degrees in [-75.0_f32, -17.0, 0.0, 45.0, 90.0, 179.0] {
+                let ruler = Geometry {
+                    center: Point::new(-2500.25, -500.5),
+                    angle: degrees.to_radians(),
+                    ..geometry(0.0, scale)
+                };
+                for side in [-1.0, 1.0] {
+                    let start = ruler.screen(20.0, side * (ruler.thickness * 0.5 + 8.0));
+                    let guide = RulerPen::new(ruler, start, 12.0 * scale).unwrap();
+                    assert!(guide.snap_y.is_some());
+                    let a = guide.project(Point::new(-6000.25, -4000.75));
+                    let b = guide.project(Point::new(6000.5, 4000.25));
+                    assert!(!guide.blocks(a) && !guide.blocks(b));
+                    assert!(guide.blocked_range(a, b).is_none());
+                }
+                let free = RulerPen::new(ruler, ruler.screen(0.0, -300.0 * scale), 2.0).unwrap();
+                let from = ruler.screen(0.0, -300.0 * scale);
+                let to = ruler.screen(0.0, 300.0 * scale);
+                assert!(free.snap_y.is_none());
+                let range = free.blocked_range(from, to).unwrap();
+                assert!(range[0] > 0.0 && range[0] < 0.5);
+                assert!(range[1] > 0.5 && range[1] < 1.0);
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_pen_inputs_do_not_create_guides_or_crossing_ranges() {
+        let ruler = geometry(0.0, 1.0);
+        let point = Point::new(0.0, 0.0);
+        for radius in [-1.0, f32::NAN, f32::INFINITY] {
+            assert!(RulerPen::new(ruler, point, radius).is_none());
+        }
+        assert!(RulerPen::new(ruler, Point::new(f32::NAN, 0.0), 1.0).is_none());
+        let guide = RulerPen::new(ruler, point, 1.0).unwrap();
+        assert!(
+            guide
+                .blocked_range(point, Point::new(f32::INFINITY, 0.0))
+                .is_none()
+        );
     }
 
     #[test]
@@ -1537,7 +1698,16 @@ mod tests {
                 assert_eq!(ruler.hit(screen(80.0 * scale, 0.0)), Some(HitTarget::Move));
                 let edge = screen(0.0, -ruler.thickness * 0.5 - 5.0 * scale);
                 assert_eq!(ruler.hit(edge), None);
-                assert!(ruler.snap(edge).is_some());
+                assert!(
+                    RulerPen::new(ruler, Point::new(edge.x as f32, edge.y as f32), 2.0)
+                        .unwrap()
+                        .snap_y
+                        .is_some()
+                );
+                let inside = ruler.screen(0.0, -ruler.thickness * 0.5 + 2.0 * scale);
+                let blocked = RulerPen::new(ruler, inside, 2.0).unwrap();
+                assert!(blocked.snap_y.is_none());
+                assert!(blocked.blocks(inside));
             }
         }
     }
@@ -1918,7 +2088,7 @@ mod tests {
         assert!(first.state.surface.borrow().is_none());
         first.set_theme(ToolbarTheme::LiquidAir).unwrap();
         assert!(first.state.surface.borrow().is_none());
-        assert!(first.snap(POINT { x: 0, y: 0 }).is_none());
+        assert!(first.pen_guide(Point::new(0.0, 0.0), 2.0).is_none());
         first.state.geometry.set(geometry(0.0, 1.0));
         unsafe {
             first.state.paint(first.handle()).unwrap();

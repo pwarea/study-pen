@@ -9,7 +9,7 @@ use crate::{
     panel_material::PanelMaterial,
     radial::{self, WheelStage, WheelState},
     removal::{RemovalImage, RemovalPlan},
-    ruler::{Ruler, RulerSnap},
+    ruler::{Ruler, RulerPen},
     settings::{Action, Hotkey, Settings},
     startup_update::{self, InstallResult, Installation, Launch},
     toolbar_drag::{DragGeometry, Point as DragPoint},
@@ -343,7 +343,7 @@ struct App {
     toolbar_edit_drag: Option<toolbar_editor::Drag>,
     shape_kind: ShapeKind,
     ruler: Option<Ruler>,
-    ruler_snap: Option<RulerSnap>,
+    ruler_pen: Option<RulerPen>,
     status: String,
     update_status: UpdateStatus,
     update_receiver: Option<mpsc::Receiver<UpdateStatus>>,
@@ -615,7 +615,7 @@ unsafe fn run_instance() -> Result<(), String> {
         toolbar_edit_drag: None,
         shape_kind: ShapeKind::Rectangle,
         ruler: None,
-        ruler_snap: None,
+        ruler_pen: None,
         status: desktop_error
             .or(shortcut_error)
             .or(identity_error)
@@ -1622,7 +1622,7 @@ impl App {
     }
 
     unsafe fn finish_gesture(&mut self) {
-        self.ruler_snap = None;
+        self.ruler_pen = None;
         if self.ink.is_drawing() {
             self.ink.end();
             self.last_point = None;
@@ -2002,20 +2002,33 @@ impl App {
         if !self.interactive || self.hold.is_some() || self.radial_hold.is_some() {
             return;
         }
-        let screen = POINT {
-            x: x + self.origin.x,
-            y: y + self.origin.y,
-        };
-        self.ruler_snap = if self.tool == Tool::Pen {
-            self.ruler.as_ref().and_then(|ruler| ruler.snap(screen))
+        let raw = Point::new(x as f32, y as f32);
+        if self.tool == Tool::Fill {
+            if let Some(bounds) = self.ink.fill_at(raw, self.primary()) {
+                self.render(Some(ink_dirty_rect(bounds)));
+            }
+            return;
+        }
+        let width = match self.tool {
+            Tool::Pen | Tool::Shape => self.settings.pen_width,
+            Tool::Eraser => self.settings.eraser_diameter,
+            Tool::ObjectEraser => 22.0,
+            Tool::Fill => return,
+        } * self.scale;
+        let screen = self.screen_point(raw);
+        self.ruler_pen = if self.tool == Tool::Pen {
+            self.ruler
+                .as_ref()
+                .and_then(|ruler| ruler.pen_guide(screen, width.clamp(0.5, 1024.0) * 0.5))
         } else {
             None
         };
-        let point = self.ink_point(screen);
-        if self.tool == Tool::Fill {
-            if let Some(bounds) = self.ink.fill_at(point, self.primary()) {
-                self.render(Some(ink_dirty_rect(bounds)));
-            }
+        let point = self.ink_point(raw);
+        if self
+            .ruler_pen
+            .is_some_and(|guide| guide.blocks(self.screen_point(point)))
+        {
+            self.ruler_pen = None;
             return;
         }
         // Keep the pre-erase width for the entire gesture: the widest stroke
@@ -2027,12 +2040,6 @@ impl App {
             .iter()
             .map(|stroke| stroke.width)
             .fold(0.0, f32::max);
-        let width = match self.tool {
-            Tool::Pen | Tool::Shape => self.settings.pen_width,
-            Tool::Eraser => self.settings.eraser_diameter,
-            Tool::ObjectEraser => 22.0,
-            Tool::Fill => return,
-        } * self.scale;
         let old_count = self.ink.strokes().len();
         let object_area = if self.tool == Tool::ObjectEraser {
             object_dirty_area(&self.ink, point, point, 11.0 * self.scale)
@@ -2067,10 +2074,7 @@ impl App {
         if !self.ink.is_drawing() {
             return;
         }
-        let point = self.ink_point(POINT {
-            x: x + self.origin.x,
-            y: y + self.origin.y,
-        });
+        let point = self.ink_point(Point::new(x as f32, y as f32));
         if self.tool == Tool::Shape {
             let before = self
                 .ink
@@ -2086,6 +2090,30 @@ impl App {
                 .map(|old| after.map_or(old, |new| old.union(new)))
                 .or(after)
             {
+                self.render(Some(dirty));
+            }
+            return;
+        }
+        if let Some([entry, exit]) = self.ruler_pen.and_then(|guide| {
+            guide.blocked_range(self.screen_point(last), self.screen_point(point))
+        }) {
+            self.last_point = Some(point);
+            let radius = (self.settings.pen_width * 0.5 + 3.0) * self.scale;
+            let mut dirty = None;
+            if entry > 0.0 {
+                let boundary = last.interpolate(point, entry);
+                self.ink.extend(boundary);
+                dirty = Some(pointer_dirty_rect(last, boundary, radius));
+            }
+            self.ink.pause_pen();
+            if exit < 1.0 {
+                let boundary = last.interpolate(point, exit);
+                self.ink.extend(boundary);
+                self.ink.extend(point);
+                let after = pointer_dirty_rect(boundary, point, radius);
+                dirty = Some(dirty.map_or(after, |before| before.union(after)));
+            }
+            if let Some(dirty) = dirty {
                 self.render(Some(dirty));
             }
             return;
@@ -2107,15 +2135,21 @@ impl App {
         }
     }
 
-    fn ink_point(&self, screen: POINT) -> Point {
-        let projected = self
-            .ruler_snap
-            .as_ref()
-            .map_or(screen, |snap| snap.project(screen));
+    fn screen_point(&self, point: Point) -> Point {
         Point::new(
-            (projected.x - self.origin.x) as f32,
-            (projected.y - self.origin.y) as f32,
+            point.x + self.origin.x as f32,
+            point.y + self.origin.y as f32,
         )
+    }
+
+    fn ink_point(&self, point: Point) -> Point {
+        self.ruler_pen.map_or(point, |guide| {
+            let projected = guide.project(self.screen_point(point));
+            Point::new(
+                projected.x - self.origin.x as f32,
+                projected.y - self.origin.y as f32,
+            )
+        })
     }
 
     unsafe fn render_pointer(&mut self, previous: Point, point: Point) {
@@ -2133,10 +2167,7 @@ impl App {
         } else {
             radius
         };
-        self.render(Some(
-            Rect::around(previous.x, previous.y, radius)
-                .union(Rect::around(point.x, point.y, radius)),
-        ));
+        self.render(Some(pointer_dirty_rect(previous, point, radius)));
     }
 
     unsafe fn open_panel(&mut self, tab: usize) {
@@ -3328,7 +3359,7 @@ unsafe extern "system" fn window_proc(
                 if hwnd == app.overlay && app.ink.is_drawing() {
                     app.ink.end();
                     app.last_point = None;
-                    app.ruler_snap = None;
+                    app.ruler_pen = None;
                 }
                 if hwnd == app.panel {
                     app.panel_drag = None;
@@ -3558,6 +3589,10 @@ fn ink_dirty_rect(bounds: crate::ink::Bounds) -> Rect {
         (bounds.max_x + 2.0).ceil() as i32 + 1,
         (bounds.max_y + 2.0).ceil() as i32 + 1,
     )
+}
+
+fn pointer_dirty_rect(from: Point, to: Point, radius: f32) -> Rect {
+    Rect::around(from.x, from.y, radius).union(Rect::around(to.x, to.y, radius))
 }
 
 fn docked_toolbar_bounds(

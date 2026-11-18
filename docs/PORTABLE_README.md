@@ -1,4 +1,4 @@
-# Study Pen 0.2.0 — portable user guide
+# Study Pen 0.2.1 — portable user guide
 
 Study Pen is a small native Windows screen annotation app. This package supports Windows 10 and Windows 11 on x86-64 computers. macOS, Linux and native ARM64 builds are not included.
 
@@ -25,6 +25,8 @@ Choose Fill shapes and click inside a rectangle, ellipse or triangle to fill it 
 ## Ruler
 
 Add **Ruler** in **Settings → Toolbar**, then click it to show or hide the ruler. Drag its body to move it. Select the pen and begin a stroke near either long edge to draw a straight line along that edge.
+
+The visible ruler also blocks new pen ink from crossing its body. Edge guidance leaves room for the full brush width, keeping thick strokes outside the ruler. A freehand stroke that crosses the ruler pauses at its edge and resumes on the other side; Undo removes all visible parts of that single held stroke together. Existing ink is unchanged.
 
 Drag **Rotate** to rotate around the ruler's center, or click it to advance by 15° clockwise. Small angles snap to horizontal; hold **Shift** while rotating for precise angles without that snap. The mouse wheel rotates by 5° per notch. Click the degree readout to reset the angle to exactly **0.0°**; dragging the readout moves the ruler instead. Click its close button to hide it. Its theme follows the toolbar; its angle lasts only for the current app session.
 
@@ -97,7 +99,7 @@ If a release only offers a download, close Study Pen before replacing the execut
 
 ## Verify the download
 
-The release includes `SHA256SUMS-0.2.0.txt` for its ZIP archives. Compare your ZIP's SHA-256 using this PowerShell command.
+The release includes `SHA256SUMS-0.2.1.txt` for its ZIP archives. Compare your ZIP's SHA-256 using this PowerShell command.
 
 ```powershell
 Get-FileHash .\study-pen-windows-x86_64-portable.zip -Algorithm SHA256

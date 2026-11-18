@@ -34,7 +34,7 @@ impl Point {
         (self.x - other.x).powi(2) + (self.y - other.y).powi(2)
     }
 
-    fn interpolate(self, other: Self, t: f32) -> Self {
+    pub(crate) fn interpolate(self, other: Self, t: f32) -> Self {
         Self::new(
             self.x + (other.x - self.x) * t,
             self.y + (other.y - self.y) * t,
@@ -252,14 +252,14 @@ impl Stroke {
 
 #[derive(Debug)]
 enum Undo {
-    RemoveLast,
+    RemoveLast { count: usize },
     Restore(Vec<Stroke>),
 }
 
 impl Undo {
     fn memory_bytes(&self) -> usize {
         match self {
-            Self::RemoveLast => std::mem::size_of::<Self>(),
+            Self::RemoveLast { .. } => std::mem::size_of::<Self>(),
             Self::Restore(strokes) => scene_bytes(strokes),
         }
     }
@@ -267,7 +267,12 @@ impl Undo {
 
 #[derive(Debug)]
 enum Gesture {
-    Pen(Stroke),
+    Pen {
+        stroke: Option<Stroke>,
+        color: Color,
+        width: f32,
+        start_count: usize,
+    },
     Shape {
         origin: Point,
         kind: ShapeKind,
@@ -302,7 +307,13 @@ impl Ink {
 
     pub fn active_stroke(&self) -> Option<&Stroke> {
         match &self.gesture {
-            Some(Gesture::Pen(stroke) | Gesture::Shape { stroke, .. }) => Some(stroke),
+            Some(
+                Gesture::Pen {
+                    stroke: Some(stroke),
+                    ..
+                }
+                | Gesture::Shape { stroke, .. },
+            ) => Some(stroke),
             _ => None,
         }
     }
@@ -324,7 +335,14 @@ impl Ink {
         }
         let width = width.clamp(0.5, 1024.0);
         match tool {
-            Tool::Pen => self.gesture = Some(Gesture::Pen(Stroke::new(point, color, width))),
+            Tool::Pen => {
+                self.gesture = Some(Gesture::Pen {
+                    stroke: Some(Stroke::new(point, color, width)),
+                    color,
+                    width,
+                    start_count: self.strokes.len(),
+                })
+            }
             Tool::Shape => self.begin_shape(point, ShapeKind::Rectangle, color, width),
             Tool::Fill => {
                 self.fill_at(point, color);
@@ -384,10 +402,19 @@ impl Ink {
             return;
         };
         match &mut gesture {
-            Gesture::Pen(stroke) => {
-                let previous = *stroke.points.last().expect("A stroke has a first point");
-                if previous.distance_squared(point) >= POINT_SPACING.powi(2) {
-                    stroke.append(point);
+            Gesture::Pen {
+                stroke,
+                color,
+                width,
+                ..
+            } => {
+                if let Some(stroke) = stroke {
+                    let previous = *stroke.points.last().expect("A stroke has a first point");
+                    if previous.distance_squared(point) >= POINT_SPACING.powi(2) {
+                        stroke.append(point);
+                    }
+                } else {
+                    *stroke = Some(Stroke::new(point, *color, *width));
                 }
             }
             Gesture::Shape {
@@ -415,19 +442,40 @@ impl Ink {
         self.gesture = Some(gesture);
     }
 
+    /// Makes the current pen fragment visible without connecting the next
+    /// sample to it. All fragments remain part of the same undo transaction.
+    /// Repeated calls while paused, or calls for another tool, are harmless.
+    pub fn pause_pen(&mut self) {
+        if let Some(Gesture::Pen { stroke, .. }) = &mut self.gesture
+            && let Some(mut fragment) = stroke.take()
+        {
+            fragment.points.shrink_to_fit();
+            self.strokes.push(fragment);
+        }
+    }
+
     pub fn end(&mut self) {
         match self.gesture.take() {
-            Some(Gesture::Pen(mut stroke)) => {
-                stroke.points.shrink_to_fit();
-                self.strokes.push(stroke);
-                self.push_undo(Undo::RemoveLast);
+            Some(Gesture::Pen {
+                stroke,
+                start_count,
+                ..
+            }) => {
+                if let Some(mut stroke) = stroke {
+                    stroke.points.shrink_to_fit();
+                    self.strokes.push(stroke);
+                }
+                let count = self.strokes.len().saturating_sub(start_count);
+                if count != 0 {
+                    self.push_undo(Undo::RemoveLast { count });
+                }
             }
             Some(Gesture::Shape { mut stroke, .. }) => {
                 // A stationary shape gesture is not an accidental pen dot.
                 if stroke.points.len() > 1 {
                     stroke.points.shrink_to_fit();
                     self.strokes.push(stroke);
-                    self.push_undo(Undo::RemoveLast);
+                    self.push_undo(Undo::RemoveLast { count: 1 });
                 }
             }
             Some(Gesture::Erase {
@@ -440,14 +488,16 @@ impl Ink {
         }
     }
 
-    /// Cancels an unfinished gesture, restoring any ink it erased.
+    /// Cancels an unfinished gesture, removing its temporary fragments or
+    /// restoring any ink it erased.
     pub fn cancel(&mut self) {
-        if let Some(Gesture::Erase {
-            before: Some(before),
-            ..
-        }) = self.gesture.take()
-        {
-            self.strokes = before;
+        match self.gesture.take() {
+            Some(Gesture::Pen { start_count, .. }) => self.strokes.truncate(start_count),
+            Some(Gesture::Erase {
+                before: Some(before),
+                ..
+            }) => self.strokes = before,
+            _ => {}
         }
     }
 
@@ -461,8 +511,9 @@ impl Ink {
         };
         self.undo_bytes = self.undo_bytes.saturating_sub(action.memory_bytes());
         match action {
-            Undo::RemoveLast => {
-                self.strokes.pop();
+            Undo::RemoveLast { count } => {
+                self.strokes
+                    .truncate(self.strokes.len().saturating_sub(count));
             }
             Undo::Restore(strokes) => self.strokes = strokes,
         }
@@ -924,6 +975,94 @@ mod tests {
         ink.end();
         assert_eq!(ink.strokes().len(), 1);
         assert_eq!(ink.strokes()[0].points, vec![Point::new(2.0, 3.0)]);
+        assert!(ink.undo());
+        assert!(!ink.undo());
+    }
+
+    #[test]
+    fn paused_pen_fragments_stay_disconnected_and_share_one_undo() {
+        let mut ink = Ink::new();
+        line(&mut ink, Point::new(0.0, 10.0), Point::new(100.0, 10.0));
+        let previous = ink.strokes().to_vec();
+        ink.begin(Point::new(10.0, 50.0), Tool::Pen, RED, 7.0);
+        ink.extend(Point::new(40.0, 50.0));
+        ink.pause_pen();
+        assert!(ink.is_drawing());
+        assert!(ink.active_stroke().is_none());
+        assert_eq!(ink.strokes().len(), previous.len() + 1);
+        ink.pause_pen();
+        assert_eq!(ink.strokes().len(), previous.len() + 1);
+
+        ink.extend(Point::new(70.0, 50.0));
+        let resumed = ink.active_stroke().unwrap();
+        assert_eq!(resumed.points, [Point::new(70.0, 50.0)]);
+        assert_eq!(resumed.color, RED);
+        assert_eq!(resumed.width, 7.0);
+        ink.extend(Point::new(110.0, 50.0));
+        ink.end();
+        assert_eq!(ink.strokes().len(), previous.len() + 2);
+        assert_eq!(
+            ink.strokes()[1].points.last(),
+            Some(&Point::new(40.0, 50.0))
+        );
+        assert_eq!(
+            ink.strokes()[2].points.first(),
+            Some(&Point::new(70.0, 50.0))
+        );
+        assert!(ink.undo());
+        assert_eq!(ink.strokes(), previous);
+        assert!(ink.undo());
+        assert!(ink.strokes().is_empty());
+        assert!(!ink.undo());
+    }
+
+    #[test]
+    fn cancelling_or_undoing_a_paused_pen_removes_only_its_temporary_fragments() {
+        for use_undo in [false, true] {
+            let mut ink = Ink::new();
+            line(&mut ink, Point::new(0.0, 10.0), Point::new(100.0, 10.0));
+            let previous = ink.strokes().to_vec();
+            ink.begin(Point::new(10.0, 50.0), Tool::Pen, RED, 4.0);
+            ink.extend(Point::new(40.0, 50.0));
+            ink.pause_pen();
+            ink.extend(Point::new(70.0, 50.0));
+            ink.pause_pen();
+            ink.extend(Point::new(110.0, 50.0));
+            if use_undo {
+                assert!(ink.undo());
+            } else {
+                ink.cancel();
+            }
+            assert!(!ink.is_drawing());
+            assert!(ink.active_stroke().is_none());
+            assert_eq!(ink.strokes(), previous);
+            assert!(ink.undo());
+            assert!(ink.strokes().is_empty());
+            assert!(!ink.undo());
+        }
+    }
+
+    #[test]
+    fn ending_while_pen_is_paused_commits_once_and_other_tools_ignore_pause() {
+        let mut ink = Ink::new();
+        ink.pause_pen();
+        ink.begin(Point::new(10.0, 20.0), Tool::Pen, RED, 4.0);
+        ink.pause_pen();
+        ink.extend(Point::new(f32::NAN, 50.0));
+        assert!(ink.active_stroke().is_none());
+        ink.end();
+        ink.end();
+        assert_eq!(ink.strokes().len(), 1);
+        assert!(ink.undo());
+        assert!(!ink.undo());
+
+        ink.begin_shape(Point::new(0.0, 0.0), ShapeKind::Rectangle, RED, 4.0);
+        ink.extend(Point::new(100.0, 80.0));
+        let preview = ink.active_stroke().unwrap().clone();
+        ink.pause_pen();
+        assert_eq!(ink.active_stroke(), Some(&preview));
+        assert!(ink.strokes().is_empty());
+        ink.end();
         assert!(ink.undo());
         assert!(!ink.undo());
     }
