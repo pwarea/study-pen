@@ -18,6 +18,10 @@ pub enum ToolbarButton {
     Shapes,
     Ruler,
     Fill,
+    /// A visible action synthesized from the saved Cursor/Pen entries. It is
+    /// never offered in the editor or written into the persisted button list.
+    #[serde(skip)]
+    PointerToggle,
 }
 
 impl ToolbarButton {
@@ -65,12 +69,25 @@ impl ToolbarButton {
             Self::Shapes => "Shapes",
             Self::Ruler => "Ruler",
             Self::Fill => "Fill shapes",
+            Self::PointerToggle => "Mouse / Pen",
         }
     }
 
-    /// Required controls remain available, but their positions are customizable.
+    pub const fn tooltip(self, interactive: bool) -> &'static str {
+        match self {
+            Self::PointerToggle if interactive => "Switch to mouse",
+            Self::PointerToggle => "Switch to pen",
+            _ => self.label(),
+        }
+    }
+
+    /// Required controls remain available in the pinned utility tail.
     pub const fn is_required(self) -> bool {
         matches!(self, Self::Settings | Self::Quit)
+    }
+
+    pub const fn is_pinned(self) -> bool {
+        matches!(self, Self::Settings | Self::Hide | Self::Quit)
     }
 }
 
@@ -97,7 +114,7 @@ pub fn default_buttons() -> Vec<ToolbarButton> {
     ToolbarButton::DEFAULT.to_vec()
 }
 
-/// Retains the chosen order and appends any missing required controls.
+/// Retains the movable tools' order and restores the pinned utility tail.
 pub fn sanitize_buttons(buttons: &mut Vec<ToolbarButton>) {
     if buttons.is_empty() {
         *buttons = default_buttons();
@@ -105,24 +122,34 @@ pub fn sanitize_buttons(buttons: &mut Vec<ToolbarButton>) {
     }
     let mut seen = 0_u16;
     buttons.retain(|button| {
+        if *button == ToolbarButton::PointerToggle {
+            return false;
+        }
         let bit = 1 << *button as u32;
         let duplicate = seen & bit != 0;
         seen |= bit;
         !duplicate
     });
-    for required in [ToolbarButton::Settings, ToolbarButton::Quit] {
-        if !buttons.contains(&required) {
-            buttons.push(required);
-        }
-    }
+    normalize_tail(buttons);
 }
 
-/// Adds an available button at the end, keeping existing button positions.
+fn normalize_tail(buttons: &mut Vec<ToolbarButton>) {
+    let hide = buttons.contains(&ToolbarButton::Hide);
+    buttons.retain(|button| !button.is_pinned());
+    buttons.push(ToolbarButton::Settings);
+    if hide {
+        buttons.push(ToolbarButton::Hide);
+    }
+    buttons.push(ToolbarButton::Quit);
+}
+
+/// Adds a tool before the utility tail, or restores Hide between Settings/Quit.
 pub fn add_button(buttons: &mut Vec<ToolbarButton>, button: ToolbarButton) -> bool {
-    if buttons.contains(&button) {
+    if button == ToolbarButton::PointerToggle || buttons.contains(&button) {
         return false;
     }
     buttons.push(button);
+    normalize_tail(buttons);
     true
 }
 
@@ -134,16 +161,23 @@ pub fn remove_button(buttons: &mut Vec<ToolbarButton>, button: ToolbarButton) ->
         return false;
     };
     buttons.remove(index);
+    normalize_tail(buttons);
     true
 }
 
-/// Moves a button to its final zero-based position, rejecting stale indices.
+/// Moves a regular tool, clamping utility-tail targets to the last tool slot.
 pub fn move_button(buttons: &mut Vec<ToolbarButton>, from: usize, to: usize) -> bool {
-    if from >= buttons.len() || to >= buttons.len() || from == to {
+    if from >= buttons.len() || to >= buttons.len() || buttons[from].is_pinned() {
+        return false;
+    }
+    let movable = buttons.iter().filter(|button| !button.is_pinned()).count();
+    let to = to.min(movable.saturating_sub(1));
+    if from == to {
         return false;
     }
     let button = buttons.remove(from);
     buttons.insert(to, button);
+    normalize_tail(buttons);
     true
 }
 
@@ -194,15 +228,16 @@ mod tests {
     #[test]
     fn customization_moves_buttons_without_duplicates_and_keeps_required_controls() {
         use ToolbarButton::*;
-        let mut buttons = vec![Settings, Pen, Color, Quit];
+        let mut buttons = vec![Pen, Color, Settings, Quit];
         assert!(add_button(&mut buttons, Ruler));
         assert!(!add_button(&mut buttons, Pen));
-        assert!(move_button(&mut buttons, 4, 1));
-        assert_eq!(buttons, [Settings, Ruler, Pen, Color, Quit]);
+        assert_eq!(buttons, [Pen, Color, Ruler, Settings, Quit]);
+        assert!(move_button(&mut buttons, 2, 0));
+        assert_eq!(buttons, [Ruler, Pen, Color, Settings, Quit]);
         assert!(move_button(&mut buttons, 0, 4));
-        assert_eq!(buttons, [Ruler, Pen, Color, Quit, Settings]);
-        assert!(move_button(&mut buttons, 3, 0));
-        assert_eq!(buttons, [Quit, Ruler, Pen, Color, Settings]);
+        assert_eq!(buttons, [Pen, Color, Ruler, Settings, Quit]);
+        assert!(!move_button(&mut buttons, 3, 0));
+        assert!(!move_button(&mut buttons, 4, 0));
         assert!(remove_button(&mut buttons, Pen));
         assert!(!remove_button(&mut buttons, Pen));
         assert!(!remove_button(&mut buttons, Settings));
@@ -210,7 +245,7 @@ mod tests {
         assert!(!move_button(&mut buttons, 4, 0));
         assert!(!move_button(&mut buttons, 0, 4));
         assert!(!move_button(&mut buttons, 0, 0));
-        assert_eq!(buttons, [Quit, Ruler, Color, Settings]);
+        assert_eq!(buttons, [Color, Ruler, Settings, Quit]);
     }
 
     #[test]
@@ -256,15 +291,59 @@ mod tests {
         use ToolbarButton::*;
         let mut buttons = vec![Ruler, Settings, Fill, Pen];
         sanitize_buttons(&mut buttons);
-        assert_eq!(buttons, [Ruler, Settings, Fill, Pen, Quit]);
+        assert_eq!(buttons, [Ruler, Fill, Pen, Settings, Quit]);
         sanitize_buttons(&mut buttons);
-        assert_eq!(buttons, [Ruler, Settings, Fill, Pen, Quit]);
+        assert_eq!(buttons, [Ruler, Fill, Pen, Settings, Quit]);
 
         let mut already_present = vec![Quit, Fill, Settings, Ruler];
         sanitize_buttons(&mut already_present);
-        assert_eq!(already_present, [Quit, Fill, Settings, Ruler]);
+        assert_eq!(already_present, [Fill, Ruler, Settings, Quit]);
         for button in ToolbarButton::ALL {
             assert_eq!(button.is_required(), matches!(button, Settings | Quit));
         }
+    }
+
+    #[test]
+    fn utility_tail_migrates_without_losing_pointer_choices_or_other_tool_order() {
+        use ToolbarButton::*;
+        let mut buttons = vec![Quit, Pen, Hide, Settings, Color, Cursor, Hide, Ruler];
+        sanitize_buttons(&mut buttons);
+        assert_eq!(buttons, [Pen, Color, Cursor, Ruler, Settings, Hide, Quit]);
+        let once = buttons.clone();
+        sanitize_buttons(&mut buttons);
+        assert_eq!(buttons, once);
+        for index in 4..7 {
+            assert!(!move_button(&mut buttons, index, 0));
+        }
+        assert!(remove_button(&mut buttons, Hide));
+        assert_eq!(buttons, [Pen, Color, Cursor, Ruler, Settings, Quit]);
+        assert!(add_button(&mut buttons, Hide));
+        assert_eq!(buttons, once);
+        assert!(add_button(&mut buttons, Fill));
+        assert_eq!(
+            buttons,
+            [Pen, Color, Cursor, Ruler, Fill, Settings, Hide, Quit]
+        );
+        assert!(move_button(&mut buttons, 0, 7));
+        assert_eq!(
+            buttons,
+            [Color, Cursor, Ruler, Fill, Pen, Settings, Hide, Quit]
+        );
+    }
+
+    #[test]
+    fn combined_action_is_visible_only_and_has_state_aware_accessible_text() {
+        use ToolbarButton::*;
+        assert!(!ToolbarButton::ALL.contains(&PointerToggle));
+        assert!(!ToolbarButton::DEFAULT.contains(&PointerToggle));
+        assert!(serde_json::to_string(&PointerToggle).is_err());
+        assert!(serde_json::from_str::<ToolbarButton>("\"pointer_toggle\"").is_err());
+        assert_eq!(PointerToggle.tooltip(false), "Switch to pen");
+        assert_eq!(PointerToggle.tooltip(true), "Switch to mouse");
+        assert_eq!(Pen.tooltip(true), "Pen");
+        let mut buttons = vec![PointerToggle, Pen, Cursor, Settings, Quit];
+        sanitize_buttons(&mut buttons);
+        assert_eq!(buttons, [Pen, Cursor, Settings, Quit]);
+        assert!(!add_button(&mut buttons, PointerToggle));
     }
 }

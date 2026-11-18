@@ -1,12 +1,14 @@
 //! Native Windows shell. The message loop sleeps whenever there is no work.
 
 use crate::{
+    cursor_motion::CursorMotion,
     docking::{self, Bounds, Edge},
     glass::Glass,
     hotkeys, identity,
     ink::{Color, Ink, Point, ShapeKind, Tool, eraser_diameter},
     overlay::{Rect, Renderer},
     panel_material::PanelMaterial,
+    pen_cursor,
     radial::{self, WheelStage, WheelState},
     removal::{RemovalImage, RemovalPlan},
     ruler::{Ruler, RulerPen},
@@ -40,11 +42,13 @@ use windows_sys::Win32::{
         Controls::{
             EM_SETLIMITTEXT, EM_SETSEL, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX,
             InitCommonControlsEx, TOOLTIPS_CLASSW, TTDT_INITIAL, TTDT_RESHOW, TTF_SUBCLASS,
-            TTM_ADDTOOLW, TTM_DELTOOLW, TTM_NEWTOOLRECTW, TTM_POP, TTM_SETDELAYTIME, TTS_ALWAYSTIP,
-            TTTOOLINFOW, WM_MOUSELEAVE,
+            TTM_ADDTOOLW, TTM_DELTOOLW, TTM_NEWTOOLRECTW, TTM_POP, TTM_SETDELAYTIME,
+            TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTTOOLINFOW, WM_MOUSELEAVE,
         },
         HiDpi::*,
-        Input::KeyboardAndMouse::*,
+        Input::{
+            GetCurrentInputMessageSource, IMO_SYSTEM, INPUT_MESSAGE_SOURCE, KeyboardAndMouse::*,
+        },
         Shell::ShellExecuteW,
         WindowsAndMessaging::*,
     },
@@ -64,6 +68,12 @@ const TIMER_RADIAL: usize = 7;
 const TIMER_DOCK: usize = 8;
 const TIMER_GLASS: usize = 9;
 const TIMER_INSTALL_UPDATE: usize = 10;
+const TIMER_PEN_CURSOR: usize = 11;
+const PEN_CURSOR_FRAME_MS: u32 = 10;
+const PEN_CURSOR_BASE: u8 = 15;
+const PEN_CURSOR_PEAK: u8 = 30;
+const PEN_CURSOR_FRAMES: usize = (PEN_CURSOR_PEAK - PEN_CURSOR_BASE + 1) as usize;
+const PRIMARY_BUTTON_DOWN: WPARAM = 0x0001;
 const DAILY_UPDATE_MS: u32 = 86_400_000;
 const GLASS_REFRESH_MS: u32 = 100;
 const REMOVE_REQUEST: u32 = WM_APP + 20;
@@ -85,6 +95,61 @@ struct EraserHold {
     resizing: bool,
 }
 
+struct PenPointer {
+    motion: CursorMotion,
+    frames: [HCURSOR; PEN_CURSOR_FRAMES],
+    tracking: bool,
+    animating: bool,
+}
+
+impl PenPointer {
+    fn new() -> Self {
+        Self {
+            motion: CursorMotion::new(),
+            frames: [ptr::null_mut(); PEN_CURSOR_FRAMES],
+            tracking: false,
+            animating: false,
+        }
+    }
+
+    fn image(&mut self, scale: f32, amount: f32) -> HCURSOR {
+        let offset = (amount.clamp(0.0, 1.0) * f32::from(PEN_CURSOR_PEAK - PEN_CURSOR_BASE)).round()
+            as usize;
+        let frame = &mut self.frames[offset];
+        if frame.is_null() {
+            *frame = pen_cursor::create(scale, PEN_CURSOR_BASE + offset as u8);
+        }
+        if frame.is_null() {
+            unsafe { LoadCursorW(ptr::null_mut(), IDC_ARROW) }
+        } else {
+            *frame
+        }
+    }
+
+    unsafe fn release_image(&self) {
+        let current = GetCursor();
+        if !current.is_null() && self.frames.contains(&current) {
+            SetCursor(LoadCursorW(ptr::null_mut(), IDC_ARROW));
+        }
+    }
+
+    unsafe fn clear_frames(&mut self) {
+        self.release_image();
+        for frame in &mut self.frames {
+            if !frame.is_null() {
+                DestroyCursor(*frame);
+                *frame = ptr::null_mut();
+            }
+        }
+    }
+}
+
+impl Drop for PenPointer {
+    fn drop(&mut self) {
+        unsafe { self.clear_frames() };
+    }
+}
+
 /// Hover remains provisional. Only releasing the main key applies a leaf.
 struct RadialHold {
     key: u32,
@@ -99,6 +164,8 @@ struct RadialHold {
 struct ToolbarTips {
     window: HWND,
     labels: [Vec<u16>; ToolbarButton::ALL.len()],
+    pointer_labels: [Vec<u16>; 2],
+    interactive: bool,
 }
 
 impl ToolbarTips {
@@ -133,6 +200,9 @@ impl ToolbarTips {
         let mut tips = Self {
             window,
             labels: ToolbarButton::ALL.map(|button| wide(button.label())),
+            pointer_labels: [false, true]
+                .map(|active| wide(ToolbarButton::PointerToggle.tooltip(active))),
+            interactive: false,
         };
         if !window.is_null() {
             for delay in [TTDT_INITIAL, TTDT_RESHOW] {
@@ -164,7 +234,11 @@ impl ToolbarTips {
                 continue;
             };
             let button = geometry.button(index).unwrap();
-            let label = &mut self.labels[button as usize];
+            let label = if button == ToolbarButton::PointerToggle {
+                &mut self.pointer_labels[usize::from(self.interactive)]
+            } else {
+                &mut self.labels[button as usize]
+            };
             let tool = TTTOOLINFOW {
                 cbSize: Self::TOOL_INFO_SIZE,
                 uFlags: TTF_SUBCLASS,
@@ -208,6 +282,41 @@ impl ToolbarTips {
             );
         }
         self.set_bounds(toolbar, geometry, scale, TTM_ADDTOOLW);
+    }
+
+    unsafe fn set_pointer_mode(
+        &mut self,
+        toolbar: HWND,
+        geometry: ToolbarGeometry,
+        interactive: bool,
+    ) {
+        if self.interactive == interactive {
+            return;
+        }
+        self.interactive = interactive;
+        if self.window.is_null() || geometry.labels {
+            return;
+        }
+        let Some(index) = (0..geometry.len())
+            .find(|&index| geometry.button(index) == Some(ToolbarButton::PointerToggle))
+        else {
+            return;
+        };
+        self.hide();
+        let tool = TTTOOLINFOW {
+            cbSize: Self::TOOL_INFO_SIZE,
+            uFlags: TTF_SUBCLASS,
+            hwnd: toolbar,
+            uId: index + 1,
+            lpszText: self.pointer_labels[usize::from(interactive)].as_mut_ptr(),
+            ..Default::default()
+        };
+        SendMessageW(
+            self.window,
+            TTM_UPDATETIPTEXTW,
+            0,
+            &tool as *const TTTOOLINFOW as isize,
+        );
     }
 
     unsafe fn hide(&self) {
@@ -331,6 +440,7 @@ struct App {
     hold: Option<EraserHold>,
     radial_hold: Option<RadialHold>,
     cursor: HCURSOR,
+    pen_pointer: PenPointer,
     tab: usize,
     editing_secondary: bool,
     hsv: (f32, f32, f32),
@@ -448,6 +558,7 @@ unsafe fn run_instance() -> Result<(), String> {
         toolbar_layout,
         &settings.toolbar_buttons,
         settings.toolbar_labels,
+        settings.separate_pointer_tools,
     );
     let (toolbar_width, toolbar_height) = toolbar_geometry.size();
     let origin = POINT {
@@ -603,6 +714,7 @@ unsafe fn run_instance() -> Result<(), String> {
         hold: None,
         radial_hold: None,
         cursor: ptr::null_mut(),
+        pen_pointer: PenPointer::new(),
         tab: 0,
         editing_secondary: false,
         hsv: ui::rgb_to_hsv(primary),
@@ -701,6 +813,7 @@ impl App {
             layout,
             &self.settings.toolbar_buttons,
             self.settings.toolbar_labels,
+            self.settings.separate_pointer_tools,
         )
     }
 
@@ -849,6 +962,7 @@ impl App {
             eraser_diameter: self.settings.eraser_diameter,
             toolbar_theme: self.settings.toolbar_theme,
             toolbar_labels: self.settings.toolbar_labels,
+            separate_pointer_tools: self.settings.separate_pointer_tools,
             toolbar_buttons: self.settings.toolbar_buttons.clone(),
             toolbar_edit_drag: self.toolbar_edit_drag,
         }
@@ -893,6 +1007,7 @@ impl App {
             return;
         }
         self.scale = scale;
+        self.pen_pointer.clear_frames();
         if IsWindowVisible(self.panel) == 0 {
             self.apply_panel_scale(scale);
         }
@@ -1621,11 +1736,15 @@ impl App {
         }
     }
 
-    unsafe fn finish_gesture(&mut self) {
+    fn end_ink_gesture(&mut self) {
         self.ruler_pen = None;
-        if self.ink.is_drawing() {
-            self.ink.end();
-            self.last_point = None;
+        self.last_point = None;
+        self.ink.end();
+    }
+
+    unsafe fn finish_gesture(&mut self) {
+        self.end_ink_gesture();
+        if GetCapture() == self.overlay {
             ReleaseCapture();
         }
     }
@@ -1636,6 +1755,9 @@ impl App {
         let changed = self.interactive != active;
         self.interactive = active;
         self.tool = tool;
+        let geometry = self.toolbar_geometry(self.toolbar_layout);
+        self.toolbar_tips
+            .set_pointer_mode(self.toolbar, geometry, active);
         let mut style = GetWindowLongPtrW(self.overlay, GWL_EXSTYLE) as u32;
         if active {
             style &= !WS_EX_TRANSPARENT;
@@ -1781,6 +1903,7 @@ impl App {
         }
         // Starting at the hub makes all four directions equally accessible,
         // and prevents an old pointer position from committing a selection.
+        self.reset_pen_pointer();
         if !self.center_radial_pointer() {
             return;
         }
@@ -1967,7 +2090,14 @@ impl App {
     }
 
     unsafe fn update_cursor(&mut self) {
-        if self.tool != Tool::Pen && self.interactive {
+        self.reset_pen_pointer();
+        if self.pen_cursor_enabled() {
+            if self.overlay_has_pointer() {
+                self.set_pen_cursor(0.0);
+            } else {
+                self.pen_pointer.release_image();
+            }
+        } else if self.interactive && self.radial_hold.is_none() {
             let diameter = if self.tool == Tool::Eraser {
                 self.settings.eraser_diameter
             } else {
@@ -1982,14 +2112,97 @@ impl App {
                 self.cursor = next;
             }
         } else {
-            SetCursor(LoadCursorW(
-                ptr::null_mut(),
-                if self.interactive {
-                    IDC_CROSS
-                } else {
-                    IDC_ARROW
-                },
-            ));
+            SetCursor(LoadCursorW(ptr::null_mut(), IDC_ARROW));
+        }
+    }
+
+    fn pen_cursor_enabled(&self) -> bool {
+        self.interactive && self.tool == Tool::Pen && self.radial_hold.is_none()
+    }
+
+    unsafe fn overlay_has_pointer(&self) -> bool {
+        let captured = GetCapture();
+        if !captured.is_null() {
+            return captured == self.overlay;
+        }
+        let mut point = POINT::default();
+        GetCursorPos(&mut point) != 0 && WindowFromPoint(point) == self.overlay
+    }
+
+    unsafe fn set_pen_cursor(&mut self, amount: f32) {
+        let cursor = self.pen_pointer.image(self.scale, amount);
+        if GetCursor() != cursor {
+            SetCursor(cursor);
+        }
+    }
+
+    unsafe fn reset_pen_pointer(&mut self) {
+        if self.pen_pointer.tracking {
+            let mut request = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_CANCEL | TME_LEAVE,
+                hwndTrack: self.overlay,
+                dwHoverTime: 0,
+            };
+            TrackMouseEvent(&mut request);
+            self.pen_pointer.tracking = false;
+        }
+        self.stop_pen_cursor_timer();
+        self.pen_pointer.motion.reset();
+    }
+
+    unsafe fn stop_pen_cursor_timer(&mut self) {
+        if self.pen_pointer.animating {
+            KillTimer(self.toolbar, TIMER_PEN_CURSOR);
+            self.pen_pointer.animating = false;
+        }
+    }
+
+    unsafe fn sample_pen_pointer(&mut self, point: POINT) {
+        if !self.pen_cursor_enabled() {
+            return;
+        }
+        if !self.pen_pointer.tracking {
+            let mut request = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: self.overlay,
+                dwHoverTime: 0,
+            };
+            self.pen_pointer.tracking = TrackMouseEvent(&mut request) != 0;
+        }
+        let now = Instant::now();
+        if self.pen_pointer.motion.record(point, self.scale, now) && !self.pen_pointer.animating {
+            self.pen_pointer.animating =
+                SetTimer(self.toolbar, TIMER_PEN_CURSOR, PEN_CURSOR_FRAME_MS, None) != 0;
+            if !self.pen_pointer.animating {
+                self.pen_pointer.motion.reset();
+            }
+        }
+        // Captured mouse moves also advance the frame when WM_TIMER is delayed
+        // by a stream of drawing messages.
+        if self.pen_pointer.animating {
+            self.advance_pen_cursor(now);
+        }
+    }
+
+    unsafe fn poll_pen_cursor(&mut self) {
+        if !self.pen_pointer.animating {
+            return;
+        }
+        if !self.pen_cursor_enabled() || !self.overlay_has_pointer() {
+            self.reset_pen_pointer();
+            self.pen_pointer.release_image();
+            return;
+        }
+        self.advance_pen_cursor(Instant::now());
+    }
+
+    unsafe fn advance_pen_cursor(&mut self, now: Instant) {
+        let frame = self.pen_pointer.motion.frame(now);
+        self.set_pen_cursor(frame.amount);
+        if !frame.active {
+            self.stop_pen_cursor_timer();
         }
     }
 
@@ -2002,6 +2215,7 @@ impl App {
         if !self.interactive || self.hold.is_some() || self.radial_hold.is_some() {
             return;
         }
+        self.finish_gesture();
         let raw = Point::new(x as f32, y as f32);
         if self.tool == Tool::Fill {
             if let Some(bounds) = self.ink.fill_at(raw, self.primary()) {
@@ -2031,6 +2245,11 @@ impl App {
             self.ruler_pen = None;
             return;
         }
+        SetCapture(self.overlay);
+        if GetCapture() != self.overlay {
+            self.ruler_pen = None;
+            return;
+        }
         // Keep the pre-erase width for the entire gesture: the widest stroke
         // may disappear on the very first sample, but its old pixels still
         // need to be included in subsequent dirty rectangles.
@@ -2053,7 +2272,6 @@ impl App {
             self.ink.begin(point, self.tool, self.primary(), width);
         }
         self.last_point = Some(point);
-        SetCapture(self.overlay);
         if self.tool == Tool::ObjectEraser {
             if old_count != self.ink.strokes().len() {
                 self.render(object_area);
@@ -2064,6 +2282,27 @@ impl App {
             }
         } else {
             self.render_pointer(point, point);
+        }
+    }
+
+    unsafe fn pointer_sample(&mut self, x: i32, y: i32, message: u32, flags: WPARAM) {
+        if !self.ink.is_drawing() {
+            return;
+        }
+        let mut source = INPUT_MESSAGE_SOURCE::default();
+        let system_generated =
+            GetCurrentInputMessageSource(&mut source) != 0 && source.originId == IMO_SYSTEM;
+        let append = should_extend_ink(
+            message,
+            flags,
+            GetCapture() == self.overlay,
+            system_generated,
+        );
+        if append {
+            self.pointer_move(x, y);
+        }
+        if !append || message == WM_LBUTTONUP {
+            self.finish_gesture();
         }
     }
 
@@ -2303,6 +2542,10 @@ impl App {
                 self.settings.toolbar_labels = !self.settings.toolbar_labels;
                 self.toolbar_reconfigured();
             }
+            Some(ToolbarCommand::SeparatePointerTools) => {
+                self.settings.separate_pointer_tools = !self.settings.separate_pointer_tools;
+                self.toolbar_reconfigured();
+            }
             Some(ToolbarCommand::Reset) => {
                 if toolbar_preferences::reset_buttons(&mut self.settings.toolbar_buttons) {
                     self.toolbar_reconfigured();
@@ -2537,6 +2780,7 @@ impl App {
             match button {
                 ToolbarButton::Cursor => self.select_tool(Tool::Pen, false),
                 ToolbarButton::Pen => self.action(Action::TogglePen, false),
+                ToolbarButton::PointerToggle => self.select_tool(Tool::Pen, !self.interactive),
                 ToolbarButton::Eraser => self.action(Action::Eraser, false),
                 ToolbarButton::ObjectEraser => self.action(Action::ObjectEraser, false),
                 ToolbarButton::Undo => self.action(Action::Undo, false),
@@ -2842,6 +3086,8 @@ impl App {
         self.close_radial();
         self.finish_gesture();
         self.stop_hold();
+        self.reset_pen_pointer();
+        self.pen_pointer.release_image();
         self.origin = POINT {
             x: GetSystemMetrics(SM_XVIRTUALSCREEN),
             y: GetSystemMetrics(SM_YVIRTUALSCREEN),
@@ -2916,12 +3162,9 @@ unsafe fn request_shape(toolbar: HWND) {
         if toolbar != app.toolbar || !app.ui_visible || app.radial_hold.is_some() || app.removing {
             return None;
         }
-        let index = app
-            .settings
-            .toolbar_buttons
-            .iter()
-            .position(|&button| button == ToolbarButton::Shapes)?;
         let geometry = app.toolbar_geometry(app.toolbar_layout);
+        let index = (0..geometry.len())
+            .find(|&index| geometry.button(index) == Some(ToolbarButton::Shapes))?;
         let (x, y, width, height) = geometry.button_bounds(index)?;
         let mut window = RECT::default();
         if GetWindowRect(toolbar, &mut window) == 0 {
@@ -3261,8 +3504,12 @@ unsafe extern "system" fn window_proc(
                 1
             }
             WM_SETCURSOR if hwnd == app.overlay => {
-                if app.interactive {
-                    SetCursor(if app.tool == Tool::Pen || app.cursor.is_null() {
+                if app.pen_cursor_enabled() {
+                    let frame = app.pen_pointer.motion.frame(Instant::now());
+                    app.set_pen_cursor(frame.amount);
+                    1
+                } else if app.interactive && app.radial_hold.is_none() {
+                    SetCursor(if app.cursor.is_null() {
                         LoadCursorW(ptr::null_mut(), IDC_CROSS)
                     } else {
                         app.cursor
@@ -3281,14 +3528,18 @@ unsafe extern "system" fn window_proc(
                     app.toolbar_click(logical_x, logical_y, POINT { x, y });
                 } else if hwnd == app.panel {
                     app.panel_click(logical_x, logical_y);
-                } else if hwnd == app.overlay {
+                } else if hwnd == app.overlay && wparam & PRIMARY_BUTTON_DOWN != 0 {
                     app.pointer_down(x, y);
                 }
                 0
             }
             WM_MOUSEMOVE => {
                 if hwnd == app.overlay {
-                    app.pointer_move(x, y);
+                    app.sample_pen_pointer(POINT {
+                        x: x + app.origin.x,
+                        y: y + app.origin.y,
+                    });
+                    app.pointer_sample(x, y, message, wparam);
                 } else if hwnd == app.panel {
                     app.panel_move(logical_x, logical_y);
                 } else if hwnd == app.toolbar {
@@ -3314,6 +3565,12 @@ unsafe extern "system" fn window_proc(
                 }
                 0
             }
+            WM_MOUSELEAVE if hwnd == app.overlay => {
+                app.pen_pointer.tracking = false;
+                app.reset_pen_pointer();
+                app.pen_pointer.release_image();
+                0
+            }
             WM_MOUSELEAVE if hwnd == app.toolbar => {
                 app.toolbar_tips.hide();
                 app.hover = None;
@@ -3327,8 +3584,7 @@ unsafe extern "system" fn window_proc(
                     app.finish_toolbar_drag();
                 }
                 if hwnd == app.overlay {
-                    app.pointer_move(x, y);
-                    app.finish_gesture();
+                    app.pointer_sample(x, y, message, wparam);
                 }
                 if hwnd == app.panel {
                     if let Some(drag) = app.toolbar_edit_drag.take() {
@@ -3356,10 +3612,8 @@ unsafe extern "system" fn window_proc(
                 if hwnd == app.toolbar {
                     app.finish_toolbar_drag();
                 }
-                if hwnd == app.overlay && app.ink.is_drawing() {
-                    app.ink.end();
-                    app.last_point = None;
-                    app.ruler_pen = None;
+                if hwnd == app.overlay {
+                    app.end_ink_gesture();
                 }
                 if hwnd == app.panel {
                     app.panel_drag = None;
@@ -3367,6 +3621,10 @@ unsafe extern "system" fn window_proc(
                         app.redraw_ui();
                     }
                 }
+                0
+            }
+            WM_CANCELMODE if hwnd == app.overlay => {
+                app.finish_gesture();
                 0
             }
             WM_CANCELMODE if hwnd == app.toolbar => {
@@ -3418,6 +3676,7 @@ unsafe extern "system" fn window_proc(
                     TIMER_RADIAL => app.poll_radial(),
                     TIMER_DOCK => app.poll_toolbar_animation(None),
                     TIMER_GLASS => app.paint_glass(),
+                    TIMER_PEN_CURSOR => app.poll_pen_cursor(),
                     _ => {}
                 }
                 0
@@ -3571,6 +3830,15 @@ unsafe extern "system" fn window_proc(
         UpdateWindow(hwnd);
     }
     result
+}
+
+fn should_extend_ink(message: u32, flags: WPARAM, captured: bool, system_generated: bool) -> bool {
+    // Check the queued button flags so a real fast stroke still gets its last
+    // samples, even if the button is already up by the time we render them.
+    captured
+        && !system_generated
+        && (message == WM_LBUTTONUP
+            || (message == WM_MOUSEMOVE && flags & PRIMARY_BUTTON_DOWN != 0))
 }
 
 fn proposed_toolbar_bounds(
@@ -3948,6 +4216,49 @@ pub fn show_error(message: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ink_samples_require_capture_and_do_not_follow_unheld_or_system_moves() {
+        let color = Color::rgb(20, 30, 40);
+        let mut ink = Ink::new();
+        ink.begin(Point::new(10.0, 10.0), Tool::Pen, color, 3.0);
+        for (message, flags, captured, system, point) in [
+            (
+                WM_MOUSEMOVE,
+                PRIMARY_BUTTON_DOWN,
+                true,
+                false,
+                Point::new(80.0, 30.0),
+            ),
+            (WM_MOUSEMOVE, 0, true, false, Point::new(900.0, 500.0)),
+        ] {
+            if should_extend_ink(message, flags, captured, system) {
+                ink.extend(point);
+            } else {
+                ink.end();
+            }
+        }
+        assert_eq!(
+            ink.strokes()[0].points,
+            [Point::new(10.0, 10.0), Point::new(80.0, 30.0)]
+        );
+        assert!(!ink.is_drawing());
+        assert!(!should_extend_ink(
+            WM_MOUSEMOVE,
+            PRIMARY_BUTTON_DOWN,
+            false,
+            false
+        ));
+        assert!(!should_extend_ink(
+            WM_MOUSEMOVE,
+            PRIMARY_BUTTON_DOWN,
+            true,
+            true
+        ));
+        assert!(should_extend_ink(WM_LBUTTONUP, 0, true, false));
+        assert!(!should_extend_ink(WM_LBUTTONUP, 0, false, false));
+        assert!(!should_extend_ink(WM_LBUTTONUP, 0, true, true));
+    }
     use windows_sys::Win32::UI::Controls::{TTM_GETDELAYTIME, TTM_GETTOOLCOUNT, TTM_GETTOOLINFOW};
 
     #[test]
@@ -4029,16 +4340,48 @@ mod tests {
             let custom = [ToolbarButton::Quit, ToolbarButton::Settings];
             tips.rebuild(
                 toolbar,
-                ToolbarGeometry::new(ToolbarLayout::Horizontal, &custom, true),
+                ToolbarGeometry::new(ToolbarLayout::Horizontal, &custom, true, true),
                 1.0,
             );
             assert_eq!(SendMessageW(tips.window, TTM_GETTOOLCOUNT, 0, 0), 0);
             tips.rebuild(
                 toolbar,
-                ToolbarGeometry::new(ToolbarLayout::Horizontal, &custom, false),
+                ToolbarGeometry::new(ToolbarLayout::Horizontal, &custom, false, true),
                 1.0,
             );
             assert_eq!(SendMessageW(tips.window, TTM_GETTOOLCOUNT, 0, 0), 2);
+            let combined = ToolbarGeometry::new(
+                ToolbarLayout::Horizontal,
+                &ToolbarButton::DEFAULT,
+                false,
+                false,
+            );
+            tips.rebuild(toolbar, combined, 1.0);
+            assert_eq!(
+                SendMessageW(tips.window, TTM_GETTOOLCOUNT, 0, 0),
+                (ToolbarButton::DEFAULT.len() - 1) as isize,
+            );
+            for active in [false, true, false] {
+                tips.set_pointer_mode(toolbar, combined, active);
+                let mut text = [0u16; 80];
+                let mut tool = TTTOOLINFOW {
+                    cbSize: ToolbarTips::TOOL_INFO_SIZE,
+                    hwnd: toolbar,
+                    uId: 1,
+                    lpszText: text.as_mut_ptr(),
+                    ..Default::default()
+                };
+                assert_ne!(
+                    SendMessageW(
+                        tips.window,
+                        TTM_GETTOOLINFOW,
+                        0,
+                        &mut tool as *mut TTTOOLINFOW as isize,
+                    ),
+                    0
+                );
+                assert!(text.starts_with(&wide(ToolbarButton::PointerToggle.tooltip(active))));
+            }
             drop(tips);
             DestroyWindow(toolbar);
         }

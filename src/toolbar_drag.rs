@@ -221,6 +221,7 @@ mod tests {
                 Horizontal,
                 &crate::toolbar_preferences::ToolbarButton::DEFAULT,
                 labels,
+                true,
             );
             for scale in [1.0_f32, 1.25, 1.5, 2.0] {
                 let horizontal = Metrics::scaled(toolbar, scale).unwrap();
@@ -285,6 +286,7 @@ mod tests {
         let toolbar = ToolbarGeometry::new(
             Vertical,
             &crate::toolbar_preferences::ToolbarButton::DEFAULT,
+            true,
             true,
         );
         let metrics = Metrics::scaled(toolbar, 1.0).unwrap();

@@ -1,4 +1,4 @@
-# Study Pen 0.2.1 — portable user guide
+# Study Pen 0.2.2 — portable user guide
 
 Study Pen is a small native Windows screen annotation app. This package supports Windows 10 and Windows 11 on x86-64 computers. macOS, Linux and native ARM64 builds are not included.
 
@@ -6,7 +6,9 @@ Study Pen is a small native Windows screen annotation app. This package supports
 
 Extract the complete ZIP into a writable folder, then run `study-pen.exe`. No installation or administrator access is required. Keep `LICENSE` and `THIRD_PARTY_NOTICES.txt` with the executable when redistributing the package.
 
-Use the pen button or **Ctrl + Alt + Shift + F1** to draw above other apps. Press the same shortcut again to click, scroll and type in those apps while keeping your ink visible. Drag the six-dot grip to move the toolbar. Hover over an icon to show its name.
+Use the combined **Mouse/Pen** button or **Ctrl + Alt + Shift + F1** to switch between drawing above other apps and clicking, scrolling or typing in them. Your ink stays visible. Drag the six-dot grip to move the toolbar. Hover over an icon to show its name.
+
+The pen pointer uses a native fountain nib with its drawing tip aligned to the stroke. Very fast pointer movement briefly enlarges it with a smooth animation to help you locate it, then returns it to its normal size.
 
 ## Toolbar layout
 
@@ -14,7 +16,9 @@ Drag the Study Pen handle toward a monitor's left or right side. On the right, i
 
 Antialiased icons stay upright in both layouts and scale with the display. The toolbar scales uniformly to fit the monitor's usable work area, keeping every control accessible on smaller or heavily scaled displays. Its last orientation and position are saved and restored at the next launch.
 
-Open **Settings → Toolbar** to choose **Liquid Glass** or the translucent blue-gradient **Liquid Air** theme. Turn on **Show tool names** for compact labels; hovering always shows the full tool name. Drag items within **On toolbar** to reorder them, from **Available tools** to add them, or back to **Available tools** to remove them. Settings and Quit can move but remain available. **Reset toolbar** restores the default tool list and order; it leaves your theme, labels, colors and shortcuts unchanged.
+Open **Settings → Toolbar** to choose **Liquid Glass** or the translucent blue-gradient **Liquid Air** theme. Turn on **Show tool names** for compact labels; hovering always shows the full tool name. Drag items within **On toolbar** to reorder them, from **Available tools** to add them, or back to **Available tools** to remove them. The last controls stay in the order **Settings → Hide toolbar → Quit Study Pen**. Settings and Quit are required; Hide toolbar is optional. **Reset toolbar** restores the default tool list and order; it leaves your theme, labels, colors and shortcuts unchanged.
+
+Mouse and pen share one switch by default. Enable **Separate Mouse and Pen** in **Settings → Toolbar** if you prefer individual buttons. This display preference keeps their configured positions, so switching back restores your separate-button order.
 
 ## Shapes and fill
 
@@ -99,7 +103,7 @@ If a release only offers a download, close Study Pen before replacing the execut
 
 ## Verify the download
 
-The release includes `SHA256SUMS-0.2.1.txt` for its ZIP archives. Compare your ZIP's SHA-256 using this PowerShell command.
+The release includes `SHA256SUMS-0.2.2.txt` for its ZIP archives. Compare your ZIP's SHA-256 using this PowerShell command.
 
 ```powershell
 Get-FileHash .\study-pen-windows-x86_64-portable.zip -Algorithm SHA256

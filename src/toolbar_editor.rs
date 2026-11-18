@@ -31,6 +31,7 @@ pub struct Drag {
 pub enum Command {
     Theme(ToolbarTheme),
     Labels,
+    SeparatePointerTools,
     Reset,
     Drag(ToolbarButton),
 }
@@ -92,12 +93,15 @@ pub fn click(x: i32, y: i32, buttons: &[ToolbarButton]) -> Option<Command> {
     if (24..436).contains(&x) && (LABEL_TOP..LABEL_BOTTOM).contains(&y) {
         return Some(Command::Labels);
     }
+    if (24..288).contains(&x) && (RESET_TOP..RESET_BOTTOM).contains(&y) {
+        return Some(Command::SeparatePointerTools);
+    }
     if (300..436).contains(&x) && (RESET_TOP..RESET_BOTTOM).contains(&y) {
         return Some(Command::Reset);
     }
     for (index, &button) in buttons.iter().enumerate() {
         if contains(cell_bounds(index, TOOLBAR_TOP), x, y) {
-            return Some(Command::Drag(button));
+            return (!button.is_required()).then_some(Command::Drag(button));
         }
     }
     for (index, button) in available(buttons).into_iter().enumerate() {
@@ -109,7 +113,8 @@ pub fn click(x: i32, y: i32, buttons: &[ToolbarButton]) -> Option<Command> {
 }
 
 /// Reorders an enabled tool, inserts an available tool, or removes a tool when
-/// dropped into Available tools. Settings and Quit can move but cannot be removed.
+/// dropped into Available tools. The fixed tail cannot be reordered; Hide can
+/// be removed and restored between Settings and Quit.
 /// Outside drops and movements under four logical pixels are cancellation.
 pub fn drop_button(buttons: &mut Vec<ToolbarButton>, drag: Drag, x: i32, y: i32) -> bool {
     let dx = i64::from(x) - i64::from(drag.start.0);
@@ -117,14 +122,26 @@ pub fn drop_button(buttons: &mut Vec<ToolbarButton>, drag: Drag, x: i32, y: i32)
     if dx.abs() < 4 && dy.abs() < 4 {
         return false;
     }
+    if drag.button.is_required() {
+        return false;
+    }
     if let Some(target) = grid_slot(x, y, TOOLBAR_TOP, buttons.len()) {
         if let Some(from) = buttons.iter().position(|button| *button == drag.button) {
+            if drag.button.is_pinned() {
+                return false;
+            }
             return toolbar_preferences::move_button(buttons, from, target.min(buttons.len() - 1));
         }
         if !toolbar_preferences::add_button(buttons, drag.button) {
             return false;
         }
-        let from = buttons.len() - 1;
+        if drag.button.is_pinned() {
+            return true;
+        }
+        let from = buttons
+            .iter()
+            .position(|button| *button == drag.button)
+            .unwrap();
         toolbar_preferences::move_button(buttons, from, target.min(from));
         return true;
     }
@@ -139,6 +156,7 @@ pub fn paint(
     p: &Painter<'_>,
     theme: ToolbarTheme,
     labels: bool,
+    separate_pointer_tools: bool,
     buttons: &[ToolbarButton],
     drag: Option<Drag>,
 ) {
@@ -242,12 +260,48 @@ pub fn paint(
         paint_grid(p, &available, top, false, buttons, drag);
     }
     p.label(
-        "Drag below to remove. Settings and Quit always stay.",
+        if separate_pointer_tools {
+            "Drag tools to arrange. The last controls stay fixed."
+        } else {
+            "Mouse / Pen share their first slot. Last controls stay fixed."
+        },
         24.0,
         520.0,
         412.0,
         1,
         MUTED,
+    );
+    p.rounded(24.0, RESET_TOP as f32, 264.0, 28.0, 7.0, SURFACE, BORDER);
+    p.label("Separate Mouse and Pen", 37.0, 554.0, 184.0, 1, TEXT);
+    p.rounded(
+        238.0,
+        556.0,
+        32.0,
+        16.0,
+        8.0,
+        if separate_pointer_tools { SELECTED } else { BG },
+        if separate_pointer_tools {
+            ACCENT
+        } else {
+            BORDER
+        },
+    );
+    p.rounded(
+        if separate_pointer_tools { 256.0 } else { 240.0 },
+        558.0,
+        12.0,
+        12.0,
+        6.0,
+        if separate_pointer_tools {
+            ACCENT
+        } else {
+            MUTED
+        },
+        if separate_pointer_tools {
+            ACCENT
+        } else {
+            MUTED
+        },
     );
     p.rounded(300.0, RESET_TOP as f32, 136.0, 28.0, 7.0, SURFACE, BORDER);
     p.center(
@@ -281,7 +335,20 @@ fn paint_grid(
     toolbar: &[ToolbarButton],
     drag: Option<Drag>,
 ) {
-    let target = drag.and_then(|drag| grid_slot(drag.point.0, drag.point.1, top, choices.len()));
+    let target = drag.and_then(|drag| {
+        let target = grid_slot(drag.point.0, drag.point.1, top, choices.len())?;
+        if !enabled {
+            return Some(target);
+        }
+        if drag.button.is_pinned() {
+            return None;
+        }
+        let movable = choices
+            .iter()
+            .take_while(|button| !button.is_pinned())
+            .count();
+        Some(target.min(movable.saturating_sub(1)))
+    });
     for (index, button) in choices.iter().enumerate() {
         let [x, y, width, height] = cell_bounds(index, top);
         let source = drag.is_some_and(|drag| drag.button == *button);
@@ -305,12 +372,13 @@ fn paint_grid(
                 BORDER
             },
         );
+        let pinned = enabled && button.is_pinned();
         p.center(
             button.label(),
             (x + 4) as f32,
-            y as f32,
+            (y + if pinned { 1 } else { 0 }) as f32,
             (width - 8) as f32,
-            height as f32,
+            if pinned { 16.0 } else { height as f32 },
             1,
             if source {
                 MUTED
@@ -320,9 +388,20 @@ fn paint_grid(
                 MUTED
             },
         );
-        if button.is_required() && toolbar.contains(button) {
-            // A small fixed marker complements the explanatory caption.
-            p.fill((x + width - 8) as f32, (y + 4) as f32, 3.0, 3.0, ACCENT);
+        if pinned && toolbar.contains(button) {
+            p.center(
+                if button.is_required() {
+                    "Fixed"
+                } else {
+                    "Drag to remove"
+                },
+                (x + 4) as f32,
+                (y + 16) as f32,
+                (width - 8) as f32,
+                15.0,
+                1,
+                MUTED,
+            );
         }
     }
     if enabled
@@ -374,6 +453,16 @@ mod tests {
         );
         assert_eq!(click(230, 170, &buttons), None);
         assert_eq!(click(25, 225, &buttons), Some(Command::Labels));
+        assert_eq!(
+            click(24, 550, &buttons),
+            Some(Command::SeparatePointerTools)
+        );
+        assert_eq!(
+            click(287, 577, &buttons),
+            Some(Command::SeparatePointerTools)
+        );
+        assert_eq!(click(288, 577, &buttons), None);
+        assert_eq!(click(299, 577, &buttons), None);
         assert_eq!(click(435, 577, &buttons), Some(Command::Reset));
         assert_eq!(click(436, 577, &buttons), None);
     }
@@ -383,7 +472,10 @@ mod tests {
         let buttons = toolbar_preferences::default_buttons();
         for (index, &button) in buttons.iter().enumerate() {
             let (x, y) = center(index, TOOLBAR_TOP);
-            assert_eq!(click(x, y, &buttons), Some(Command::Drag(button)));
+            assert_eq!(
+                click(x, y, &buttons),
+                (!button.is_required()).then_some(Command::Drag(button))
+            );
         }
         for (index, button) in available(&buttons).into_iter().enumerate() {
             let (x, y) = center(index, available_top(&buttons));
@@ -463,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn required_controls_can_be_reordered_with_their_identity_intact() {
+    fn fixed_controls_reject_drag_start_and_tools_cannot_enter_the_tail() {
         let mut buttons = toolbar_preferences::default_buttons();
         for button in [ToolbarButton::Quit, ToolbarButton::Settings] {
             let index = buttons
@@ -471,21 +563,86 @@ mod tests {
                 .position(|candidate| *candidate == button)
                 .unwrap();
             let target = center(0, TOOLBAR_TOP);
+            let source = center(index, TOOLBAR_TOP);
+            assert_eq!(click(source.0, source.1, &buttons), None);
             let drag = Drag {
                 button,
-                start: center(index, TOOLBAR_TOP),
+                start: source,
                 point: target,
             };
-            assert!(drop_button(&mut buttons, drag, target.0, target.1));
-            assert_eq!(buttons[0], button);
-            assert_eq!(
-                buttons
-                    .iter()
-                    .filter(|candidate| **candidate == button)
-                    .count(),
-                1
-            );
+            assert!(!drop_button(&mut buttons, drag, target.0, target.1));
         }
+        let target = center(buttons.len() - 1, TOOLBAR_TOP);
+        let drag = Drag {
+            button: ToolbarButton::Pen,
+            start: center(1, TOOLBAR_TOP),
+            point: target,
+        };
+        assert!(drop_button(&mut buttons, drag, target.0, target.1));
+        assert_eq!(buttons[buttons.len() - 4], ToolbarButton::Pen);
+        assert_eq!(
+            &buttons[buttons.len() - 3..],
+            &[
+                ToolbarButton::Settings,
+                ToolbarButton::Hide,
+                ToolbarButton::Quit
+            ]
+        );
+        let target = center(buttons.len() - 1, TOOLBAR_TOP);
+        let drag = Drag {
+            button: ToolbarButton::Ruler,
+            start: center(1, available_top(&buttons)),
+            point: target,
+        };
+        assert!(drop_button(&mut buttons, drag, target.0, target.1));
+        assert_eq!(buttons[buttons.len() - 4], ToolbarButton::Ruler);
+        assert_eq!(
+            &buttons[buttons.len() - 3..],
+            &[
+                ToolbarButton::Settings,
+                ToolbarButton::Hide,
+                ToolbarButton::Quit
+            ]
+        );
+    }
+
+    #[test]
+    fn hide_can_be_removed_and_restored_but_cannot_be_reordered() {
+        let mut buttons = toolbar_preferences::default_buttons();
+        let from = center(8, TOOLBAR_TOP);
+        assert_eq!(
+            click(from.0, from.1, &buttons),
+            Some(Command::Drag(ToolbarButton::Hide))
+        );
+        let target = center(0, TOOLBAR_TOP);
+        let mut drag = Drag {
+            button: ToolbarButton::Hide,
+            start: from,
+            point: target,
+        };
+        assert!(!drop_button(&mut buttons, drag, target.0, target.1));
+        drag.point = center(0, available_top(&buttons));
+        assert!(drop_button(&mut buttons, drag, drag.point.0, drag.point.1));
+        assert_eq!(
+            &buttons[buttons.len() - 2..],
+            &[ToolbarButton::Settings, ToolbarButton::Quit]
+        );
+        let start = center(0, available_top(&buttons));
+        let target = center(0, TOOLBAR_TOP);
+        let drag = Drag {
+            button: ToolbarButton::Hide,
+            start,
+            point: target,
+        };
+        assert!(drop_button(&mut buttons, drag, target.0, target.1));
+        assert_eq!(
+            &buttons[buttons.len() - 3..],
+            &[
+                ToolbarButton::Settings,
+                ToolbarButton::Hide,
+                ToolbarButton::Quit
+            ]
+        );
     }
 
     #[test]

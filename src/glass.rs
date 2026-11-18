@@ -122,6 +122,7 @@ struct GlyphKey {
     primary: Color,
     dark: bool,
     theme: ToolbarTheme,
+    pointer_is_mouse: Option<bool>,
 }
 
 impl GlyphKey {
@@ -132,6 +133,10 @@ impl GlyphKey {
             primary: controls.primary,
             dark: controls.dark,
             theme: controls.theme,
+            pointer_is_mouse: controls
+                .geometry
+                .has_pointer_toggle()
+                .then_some(controls.interactive),
         }
     }
 }
@@ -915,6 +920,34 @@ mod tests {
         changed = controls;
         changed.theme = ToolbarTheme::LiquidAir;
         assert!(key != GlyphKey::new(1.0, &changed));
+    }
+
+    #[test]
+    fn combined_pointer_cache_tracks_mouse_pen_action_but_ignores_drawing_tool() {
+        let mut controls = ToolbarControls {
+            geometry: ToolbarGeometry::new(
+                ToolbarLayout::Horizontal,
+                &ToolbarButton::DEFAULT,
+                true,
+                false,
+            ),
+            theme: ToolbarTheme::LiquidGlass,
+            interactive: false,
+            tool: Tool::Pen,
+            primary: Color::rgb(16, 32, 48),
+            hover: None,
+            dark: false,
+            ruler_visible: false,
+        };
+        let pen = GlyphKey::new(1.0, &controls);
+        controls.interactive = true;
+        let mouse = GlyphKey::new(1.0, &controls);
+        assert!(pen != mouse);
+        controls.tool = Tool::Eraser;
+        controls.hover = Some(0);
+        assert!(mouse == GlyphKey::new(1.0, &controls));
+        controls.geometry = controls.geometry.with_layout(ToolbarLayout::Vertical);
+        assert!(mouse != GlyphKey::new(1.0, &controls));
     }
 
     #[test]

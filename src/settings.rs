@@ -228,6 +228,8 @@ pub struct Settings {
     pub toolbar_theme: ToolbarTheme,
     #[serde(deserialize_with = "toolbar_preferences::deserialize_labels")]
     pub toolbar_labels: bool,
+    #[serde(deserialize_with = "toolbar_preferences::deserialize_labels")]
+    pub separate_pointer_tools: bool,
     #[serde(deserialize_with = "toolbar_preferences::deserialize_buttons")]
     pub toolbar_buttons: Vec<ToolbarButton>,
     #[serde(skip)]
@@ -295,6 +297,7 @@ impl Default for Settings {
             toolbar_vertical: false,
             toolbar_theme: ToolbarTheme::default(),
             toolbar_labels: false,
+            separate_pointer_tools: false,
             toolbar_buttons: toolbar_preferences::default_buttons(),
             storage: RefCell::default(),
             hotkey_notice: None,
@@ -800,6 +803,7 @@ mod tests {
         assert!(settings.github_repository.is_none());
         assert!(settings.toolbar_visible);
         assert!(!settings.toolbar_vertical);
+        assert!(!settings.separate_pointer_tools);
         assert!(!settings.desktop_shortcut_seen);
         assert_eq!(Action::ALL.len(), 9);
         assert_eq!(Action::RadialMenu.index(), 8);
@@ -828,6 +832,7 @@ mod tests {
         assert!(!settings.toolbar_vertical);
         assert_eq!(settings.toolbar_theme, ToolbarTheme::LiquidGlass);
         assert!(!settings.toolbar_labels);
+        assert!(!settings.separate_pointer_tools);
         assert_eq!(settings.toolbar_buttons, ToolbarButton::DEFAULT);
     }
 
@@ -839,6 +844,7 @@ mod tests {
             "check_for_updates": false,
             "toolbar_theme": "future_theme",
             "toolbar_labels": "invalid",
+            "separate_pointer_tools": "invalid",
             "toolbar_buttons": ["ruler", "pen", "ruler", "future_button", null, 7, "fill"]
         }))
         .unwrap();
@@ -848,6 +854,7 @@ mod tests {
         assert!(!settings.check_for_updates);
         assert_eq!(settings.toolbar_theme, ToolbarTheme::LiquidGlass);
         assert!(!settings.toolbar_labels);
+        assert!(!settings.separate_pointer_tools);
         assert_eq!(
             settings.toolbar_buttons,
             [
@@ -876,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn older_toolbar_preferences_append_quit_without_resetting_user_choices() {
+    fn older_toolbar_preferences_fix_tail_without_resetting_tool_order() {
         let mut settings: Settings = serde_json::from_value(serde_json::json!({
             "primary_color": "#123456",
             "toolbar_theme": "liquid_air",
@@ -889,9 +896,9 @@ mod tests {
             settings.toolbar_buttons,
             [
                 ToolbarButton::Ruler,
-                ToolbarButton::Settings,
                 ToolbarButton::Fill,
                 ToolbarButton::Pen,
+                ToolbarButton::Settings,
                 ToolbarButton::Quit
             ]
         );
@@ -901,7 +908,7 @@ mod tests {
         let serialized = serde_json::to_value(&settings).unwrap();
         assert_eq!(
             serialized["toolbar_buttons"],
-            serde_json::json!(["ruler", "settings", "fill", "pen", "quit"])
+            serde_json::json!(["ruler", "fill", "pen", "settings", "quit"])
         );
     }
 
@@ -1260,11 +1267,12 @@ mod tests {
         settings.desktop_shortcut_seen = true;
         settings.toolbar_theme = ToolbarTheme::LiquidAir;
         settings.toolbar_labels = true;
+        settings.separate_pointer_tools = true;
         settings.toolbar_buttons = vec![
             ToolbarButton::Fill,
-            ToolbarButton::Settings,
             ToolbarButton::Ruler,
             ToolbarButton::Pen,
+            ToolbarButton::Settings,
             ToolbarButton::Quit,
         ];
         settings.save().unwrap();
@@ -1287,6 +1295,7 @@ mod tests {
         assert!(reloaded.desktop_shortcut_seen);
         assert_eq!(reloaded.toolbar_theme, ToolbarTheme::LiquidAir);
         assert!(reloaded.toolbar_labels);
+        assert!(reloaded.separate_pointer_tools);
         assert_eq!(reloaded.toolbar_buttons, settings.toolbar_buttons);
         let json: serde_json::Value =
             serde_json::from_slice(&fs::read(&portable).unwrap()).unwrap();
@@ -1295,9 +1304,10 @@ mod tests {
         assert_eq!(json["toolbar_vertical"], true);
         assert_eq!(json["toolbar_theme"], "liquid_air");
         assert_eq!(json["toolbar_labels"], true);
+        assert_eq!(json["separate_pointer_tools"], true);
         assert_eq!(
             json["toolbar_buttons"],
-            serde_json::json!(["fill", "settings", "ruler", "pen", "quit"])
+            serde_json::json!(["fill", "ruler", "pen", "settings", "quit"])
         );
         assert!(json.get("storage").is_none());
         assert!(json.get("hotkey_notice").is_none());

@@ -17,11 +17,12 @@ Study Pen runs on 64-bit Windows 10 and 11. It needs no installer or administrat
 ## Use Study Pen
 
 - Drag the six-dot grip to move the glass toolbar. Pull it past a side edge to dock it vertically.
-- Click the pen to draw or the cursor to use the desktop. Undo restores the last drawing, erasing, or clearing action.
+- Use the combined **Mouse/Pen** button to switch between drawing and desktop interaction. Enable **Separate Mouse and Pen** in **Settings → Toolbar** for individual buttons. Undo restores the last drawing, erasing, or clearing action.
+- A native fountain nib marks the pen tip. Very fast pointer movement briefly enlarges it to help you locate it.
 - Use the regular eraser for part of a line and the object eraser for the whole stroke. Hold the eraser shortcut and move the mouse up or down to change its size.
 - Pick colors with the swatches or enter HEX or RGB values. Assign a shortcut to swap between your two saved colors.
 - Open **Settings → Shortcuts** to customize keys and bind the optional radial menu. You can hide or restore the toolbar from the system tray.
-- In **Settings → Toolbar**, choose **Liquid Glass** or the blue **Liquid Air** theme, show tool names, and drag tools to add, remove or reorder them. **Reset toolbar** restores the default tools and order.
+- In **Settings → Toolbar**, choose **Liquid Glass** or the blue **Liquid Air** theme, show tool names, and drag tools to add, remove or reorder them. The last controls stay **Settings → Hide toolbar (optional) → Quit Study Pen**. **Reset toolbar** restores the default tools and order.
 - Add **Shapes**, **Fill shapes** and **Ruler** from the toolbar editor. Draw rectangles, ellipses, lines, arrows or triangles; fill closed shapes with your selected color; or draw straight pen strokes along the ruler.
 - Drag the ruler to move it. Drag **Rotate** to change its angle, hold **Shift** for precise angles, or click the degree readout to reset it to **0.0°**.
 

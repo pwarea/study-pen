@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod cursor_motion;
 mod docking;
 mod glass;
 mod hotkeys;
@@ -10,6 +11,7 @@ mod install_update;
 mod overlay;
 mod panel_material;
 mod panel_primitives;
+mod pen_cursor;
 mod radial;
 mod removal;
 mod ruler;

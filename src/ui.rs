@@ -46,11 +46,44 @@ pub struct ToolbarGeometry {
 }
 
 impl ToolbarGeometry {
-    pub fn new(layout: ToolbarLayout, buttons: &[ToolbarButton], labels: bool) -> Self {
-        let count = buttons.len().min(ToolbarButton::ALL.len());
+    pub fn new(
+        layout: ToolbarLayout,
+        buttons: &[ToolbarButton],
+        labels: bool,
+        separate_pointer_tools: bool,
+    ) -> Self {
         let mut slots = [None; ToolbarButton::ALL.len()];
-        for (slot, &button) in slots.iter_mut().zip(buttons) {
-            *slot = Some(button);
+        let mut count = 0;
+        let mut pointer_added = false;
+        let tail = [
+            ToolbarButton::Settings,
+            ToolbarButton::Hide,
+            ToolbarButton::Quit,
+        ];
+        let ordered = buttons
+            .iter()
+            .filter(|button| !button.is_pinned())
+            .chain(tail.iter().filter(|button| buttons.contains(button)));
+        for &button in ordered {
+            if button == ToolbarButton::PointerToggle {
+                continue;
+            }
+            let button = if !separate_pointer_tools
+                && matches!(button, ToolbarButton::Cursor | ToolbarButton::Pen)
+            {
+                if pointer_added {
+                    continue;
+                }
+                pointer_added = true;
+                ToolbarButton::PointerToggle
+            } else {
+                button
+            };
+            if count == slots.len() {
+                break;
+            }
+            slots[count] = Some(button);
+            count += 1;
         }
         Self {
             layout,
@@ -62,7 +95,7 @@ impl ToolbarGeometry {
 
     #[cfg(test)]
     pub fn default_for(layout: ToolbarLayout) -> Self {
-        Self::new(layout, &ToolbarButton::DEFAULT, false)
+        Self::new(layout, &ToolbarButton::DEFAULT, false, true)
     }
 
     pub fn with_layout(self, layout: ToolbarLayout) -> Self {
@@ -75,6 +108,10 @@ impl ToolbarGeometry {
 
     pub fn len(self) -> usize {
         self.count
+    }
+
+    pub fn has_pointer_toggle(self) -> bool {
+        self.buttons[..self.count].contains(&Some(ToolbarButton::PointerToggle))
     }
 
     fn track_start(self, index: usize) -> i32 {
@@ -180,6 +217,7 @@ pub struct UiState {
     pub eraser_diameter: f32,
     pub toolbar_theme: ToolbarTheme,
     pub toolbar_labels: bool,
+    pub separate_pointer_tools: bool,
     pub toolbar_buttons: Vec<ToolbarButton>,
     pub toolbar_edit_drag: Option<toolbar_editor::Drag>,
 }
@@ -199,6 +237,23 @@ pub struct ToolbarControls {
 impl ToolbarControls {
     pub fn button(&self, index: usize) -> Option<ToolbarButton> {
         self.geometry.button(index)
+    }
+
+    /// The combined slot shows the action the next click will perform.
+    pub fn display_button(&self, index: usize) -> Option<ToolbarButton> {
+        self.button(index).map(|button| match button {
+            ToolbarButton::PointerToggle if self.interactive => ToolbarButton::Cursor,
+            ToolbarButton::PointerToggle => ToolbarButton::Pen,
+            _ => button,
+        })
+    }
+
+    pub fn caption(&self, index: usize) -> Option<&'static str> {
+        if self.button(index)? == ToolbarButton::PointerToggle && self.interactive {
+            Some("Mouse")
+        } else {
+            self.display_button(index).map(toolbar_caption)
+        }
     }
 
     pub fn selected(&self) -> Option<usize> {
@@ -623,7 +678,7 @@ pub fn toolbar_pixels(
     }
     let mut labels = Vec::new();
     for index in 0..geometry.len() {
-        let button = geometry.button(index)?;
+        let button = state.display_button(index)?;
         let (left, top, width, height) = geometry.button_bounds(index)?;
         let x = left as f32 + width as f32 / 2.0;
         let y = if geometry.labels {
@@ -632,7 +687,7 @@ pub fn toolbar_pixels(
                 ToolbarLayout::Vertical => (11.0, 22),
             };
             labels.push(Label {
-                text: toolbar_caption(button),
+                text: state.caption(index)?,
                 bounds: [left, top + label_y, width, 16],
             });
             top as f32 + icon_y
@@ -705,7 +760,7 @@ fn toolbar_icon(button: ToolbarButton) -> Option<Path> {
             path.line_to(8.0, 19.9);
             path.close();
         }
-        Pen => {
+        Pen | PointerToggle => {
             path.move_to(4.5, 19.5);
             path.line_to(5.6, 13.9);
             path.line_to(16.0, 3.6);
@@ -897,6 +952,7 @@ pub unsafe fn paint_panel(dc: HDC, scale: f32, state: &UiState, material: Option
             &p,
             state.toolbar_theme,
             state.toolbar_labels,
+            state.separate_pointer_tools,
             &state.toolbar_buttons,
             state.toolbar_edit_drag,
         ),
@@ -1295,6 +1351,92 @@ mod tests {
     }
 
     #[test]
+    fn combined_pointer_preserves_saved_tools_and_uses_the_first_pointer_slot() {
+        use ToolbarButton::*;
+        for layout in [ToolbarLayout::Horizontal, ToolbarLayout::Vertical] {
+            for raw in [
+                vec![Color, Pen, Ruler, Cursor, Settings, Hide, Quit],
+                vec![Color, Cursor, Ruler, Pen, Settings, Hide, Quit],
+                vec![Color, Pen, Ruler, Settings, Hide, Quit],
+                vec![Color, Cursor, Ruler, Settings, Hide, Quit],
+            ] {
+                let saved = raw.clone();
+                let combined = ToolbarGeometry::new(layout, &raw, true, false);
+                assert_eq!(raw, saved);
+                let visible: Vec<_> = (0..combined.len())
+                    .map(|i| combined.button(i).unwrap())
+                    .collect();
+                assert_eq!(visible, [Color, PointerToggle, Ruler, Settings, Hide, Quit]);
+                let separate = ToolbarGeometry::new(layout, &raw, true, true);
+                assert_eq!(
+                    (0..separate.len())
+                        .map(|i| separate.button(i).unwrap())
+                        .collect::<Vec<_>>(),
+                    raw
+                );
+                let raw_again = ToolbarGeometry::new(layout, &raw, true, false);
+                assert_eq!(raw_again, combined);
+                assert!(combined.has_pointer_toggle());
+                assert!(combined.button(combined.len()).is_none());
+                assert!(combined.button_bounds(combined.len()).is_none());
+                for index in 0..combined.len() {
+                    let (x, y, width, height) = combined.button_bounds(index).unwrap();
+                    assert_eq!(
+                        combined.hit_test(x + width / 2, y + height / 2),
+                        Some(index)
+                    );
+                    assert_eq!(combined.hit_test(x + width, y + height / 2), None);
+                    assert!(!combined.is_drag_handle(x + width / 2, y + height / 2));
+                }
+                let (width, height) = combined.size();
+                let mut state = toolbar_state(layout, false);
+                state.geometry = combined;
+                for interactive in [false, true] {
+                    state.interactive = interactive;
+                    assert!(toolbar_pixels(width as u32, height as u32, 1.0, &state).is_some());
+                }
+            }
+            let no_pointer = ToolbarGeometry::new(layout, &[Color, Settings, Quit], false, false);
+            assert!(!no_pointer.has_pointer_toggle());
+            assert_eq!(no_pointer.len(), 3);
+        }
+    }
+
+    #[test]
+    fn combined_pointer_shows_the_next_action_without_a_false_selected_chip() {
+        use ToolbarButton::*;
+        for layout in [ToolbarLayout::Horizontal, ToolbarLayout::Vertical] {
+            for labels in [false, true] {
+                let geometry = ToolbarGeometry::new(layout, &ToolbarButton::DEFAULT, labels, false);
+                assert_eq!(geometry.len(), ToolbarButton::DEFAULT.len() - 1);
+                let mut state = toolbar_state(layout, false);
+                state.geometry = geometry;
+                state.interactive = false;
+                assert_eq!(state.display_button(0), Some(Pen));
+                assert_eq!(state.caption(0), Some("Pen"));
+                assert_eq!(state.selected(), None);
+                let (width, height) = geometry.size();
+                let pen = toolbar_pixels(width as u32, height as u32, 1.0, &state).unwrap();
+                for tool in [
+                    Tool::Pen,
+                    Tool::Eraser,
+                    Tool::ObjectEraser,
+                    Tool::Shape,
+                    Tool::Fill,
+                ] {
+                    state.interactive = true;
+                    state.tool = tool;
+                    assert_eq!(state.display_button(0), Some(Cursor));
+                    assert_eq!(state.caption(0), Some("Mouse"));
+                    assert_ne!(state.selected(), Some(0));
+                    let mouse = toolbar_pixels(width as u32, height as u32, 1.0, &state).unwrap();
+                    assert_ne!(mouse, pen);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn toolbar_raster_preserves_antialiased_icons_at_common_dpi_and_fitted_scales() {
         let scales = [96, 120, 144, 192].map(|dpi| dpi as f32 / 96.0);
         for layout in [ToolbarLayout::Horizontal, ToolbarLayout::Vertical] {
@@ -1447,8 +1589,8 @@ mod tests {
     fn short_names_keep_the_same_outer_toolbar_size() {
         for layout in [ToolbarLayout::Horizontal, ToolbarLayout::Vertical] {
             for buttons in [&ToolbarButton::DEFAULT[..], &ToolbarButton::ALL[..]] {
-                let plain = ToolbarGeometry::new(layout, buttons, false);
-                let named = ToolbarGeometry::new(layout, buttons, true);
+                let plain = ToolbarGeometry::new(layout, buttons, false, true);
+                let named = ToolbarGeometry::new(layout, buttons, true, true);
                 assert_eq!(named.size(), plain.size());
                 assert_eq!(named.handle_size(), plain.handle_size());
                 for index in 0..named.len() {
